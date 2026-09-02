@@ -841,14 +841,14 @@ const EVENT_TYPES = ['増乳開始','ピーク到達','減乳開始','離乳','�
  *               表や列が増えたときだけ上げる。上げたら Code.gs のデプロイも必要。
  * BUILD_ID     … この index.html を作った日時。作るたびに毎回変わる。
  *               「新しい画面が出ていないか」を見るためだけに使う。
- *               build.sh が 2026-09-02-0335 を実際の日時に置き換えます。
+ *               build.sh が 2026-09-02-0419 を実際の日時に置き換えます。
  */
 /* カルテを開いた瞬間に要る表と、タブを開いたときでいい表 */
 const COW_CORE_TABLES = ['weights', 'milk_feed', 'starter', 'repro', 'events', 'colostrum'];
 const COW_LAZY_TABLES = ['genomics', 'milk_test'];
 
-const APP_VERSION = '2026-09-02a';
-const BUILD_ID = '2026-09-02-0335';
+const APP_VERSION = '2026-09-02b';
+const BUILD_ID = '2026-09-02-0419';
 const REQUIRED_TABLES = ['cows', 'weights', 'milk_feed', 'starter', 'repro', 'events',
                          'genomics', 'milk_test', 'colostrum', 'pens', 'daily_check',
                          'settings'];
@@ -998,6 +998,18 @@ const Store = {
           { updated_at: new Date().toISOString() });
         this.saveLocal(); return db[p.table][i];
       }
+      case 'cowsBulk': {
+        const want = (p.tables && p.tables.length) ? p.tables : COW_CORE_TABLES;
+        const out = {};
+        (p.cow_nos || []).forEach(x => {
+          const no = String(x);
+          out[no] = {};
+          want.forEach(t => {
+            out[no][t] = (db[t] || []).filter(r => String(r.cow_no) === no);
+          });
+        });
+        return out;
+      }
       case 'updateMany': {
         let n = 0;
         (p.rows || []).forEach(row => {
@@ -1143,6 +1155,37 @@ const Store = {
     missing.forEach(t => { if (!rec[t]) rec[t] = []; });
     this.cache[key] = rec;
     return rec;
+  },
+
+  /* ------------------------------------------------------------
+     よく開く牛のぶんを、まとめて先に取っておく
+     ------------------------------------------------------------
+     スプレッドシートとの1往復は、どんなに軽くても数秒かかります。
+     読む量を減らしてもこの数秒は減らないので、往復そのものをなくします。
+     起動したあと、裏で1回だけまとめて取っておけば、
+     そのあと牛をタップしたときは通信ゼロで、すぐ出ます。
+     ------------------------------------------------------------ */
+  async prefetch(nos, tables){
+    const want = tables || COW_CORE_TABLES;
+    const need = [];
+    (nos || []).forEach(x => {
+      const no = String(x);
+      if (!no) return;
+      const c = this.cache[no];
+      if (!c || want.some(t => !c[t])) need.push(no);
+    });
+    if (!need.length) return 0;
+    const d = await this.call({ action: 'cowsBulk', cow_nos: need, tables: want });
+    let n = 0;
+    Object.keys(d || {}).forEach(no => {
+      const rec = this.cache[no] || {};
+      Object.keys(d[no] || {}).forEach(t => {
+        rec[t] = (d[no][t] || []).slice()
+          .sort((a, b) => String(a.date) < String(b.date) ? -1 : 1);
+      });
+      this.cache[no] = rec; n++;
+    });
+    return n;
   },
 
   /** タップされる前に、そっと先に取りに行っておく（失敗しても何も言わない） */
@@ -9403,6 +9446,8 @@ const Updater = {
     App.ready = true;
     App.render();
     if (!Store.isRemote && !Store.cows.length) showWelcome();
+    // 画面が出たあと、裏でよく開く牛のぶんを取っておく
+    setTimeout(warmLikelyCows, 400);
   } catch (e){
     App.ready = true;
     App.view = 'settings';
@@ -9412,6 +9457,32 @@ const Updater = {
       el('b', {}, '接続できませんでした。'), ' ', e.message), main.firstChild);
   }
 })();
+
+/**
+ * これから開かれそうな牛のぶんを、裏でまとめて取っておく。
+ *
+ * 対象は「最近見た牛」＋「まだ若い牛（〜400日齢）」。
+ * このアプリが見ているのは出生〜初回分娩なので、実際に開かれるのはほぼこの範囲です。
+ * 失敗しても何も言いません（今までどおり、タップした時に取りに行くだけ）。
+ */
+async function warmLikelyCows(){
+  if (!Store.isRemote) return;          // お試しモードは元から手元にある
+  try {
+    const young = Store.cows
+      .map(c => ({ c, d: ageDays(c.birth_date) }))
+      .filter(x => x.d != null && x.d <= 400)
+      .sort((a, b) => a.d - b.d)           // 若い牛ほどよく開く
+      .map(x => x.c.cow_no);
+    const nos = Array.from(new Set((App.recent || []).concat(young))).slice(0, 150);
+    if (!nos.length) return;
+    // まず、カルテを開いた瞬間に要るぶん（約226KB）
+    await Store.prefetch(nos);
+    // 少し置いてから、ゲノムも（約189KB）。
+    // これで概要のゲノム欄も待ち時間なしになります。
+    await new Promise(r => setTimeout(r, 1500));
+    await Store.prefetch(nos, ['genomics']);
+  } catch (e){ /* 古いスプレッドシート側でも、ただ効かないだけ */ }
+}
 
 function showWelcome(){
   sheet('はじめに', (b, close) => {
