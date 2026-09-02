@@ -765,16 +765,12 @@ const Pens = {
   /** その部屋にいる牛（売却・廃用を除く） */
   cowsIn(name){
     const s = String(name || '').trim();
-    return Store.cows.filter(c =>
-      String(c.pen || '').trim() === s &&
-      !/売却|廃用|死亡|出荷/.test(String(c.status || '')));
+    return Store.cows.filter(c => String(c.pen || '').trim() === s && isOnFarm(c));
   },
   /** どこにも入っていない牛 */
   unassigned(){
     const names = new Set(this.all().map(p => p.name));
-    return Store.cows.filter(c =>
-      !/売却|廃用|死亡|出荷/.test(String(c.status || '')) &&
-      !names.has(String(c.pen || '').trim()));
+    return Store.cows.filter(c => isOnFarm(c) && !names.has(String(c.pen || '').trim()));
   },
   /** その牛の1つ前／1つ後ろの部屋 */
   neighbor(name, dir){
@@ -810,7 +806,7 @@ const GROUPS = {
   breeding:  { key:'breeding',  label:'種付け期',      short:'種付け', order:7, milk:false, color:'--s7' },
   pregnant:  { key:'pregnant',  label:'未経産 妊娠+',  short:'妊娠+',  order:8, milk:false, color:'--s6' },
   milking:   { key:'milking',   label:'経産',          short:'経産',   order:9, milk:false, color:'--ink-2' },
-  sold:      { key:'sold',      label:'売却・廃用',    short:'売却',   order:10,milk:false, color:'--muted' },
+  sold:      { key:'sold',      label:'牧場を出た牛',  short:'場外',   order:10,milk:false, color:'--muted' },
   unknown:   { key:'unknown',   label:'（不明）',      short:'—',      order:11,milk:false, color:'--muted' }
 };
 const GROUP_LIST = Object.values(GROUPS).sort((a,b) => a.order - b.order);
@@ -841,14 +837,14 @@ const EVENT_TYPES = ['増乳開始','ピーク到達','減乳開始','離乳','�
  *               表や列が増えたときだけ上げる。上げたら Code.gs のデプロイも必要。
  * BUILD_ID     … この index.html を作った日時。作るたびに毎回変わる。
  *               「新しい画面が出ていないか」を見るためだけに使う。
- *               build.sh が 2026-09-02-0419 を実際の日時に置き換えます。
+ *               build.sh が 2026-09-02-0543 を実際の日時に置き換えます。
  */
 /* カルテを開いた瞬間に要る表と、タブを開いたときでいい表 */
 const COW_CORE_TABLES = ['weights', 'milk_feed', 'starter', 'repro', 'events', 'colostrum'];
 const COW_LAZY_TABLES = ['genomics', 'milk_test'];
 
-const APP_VERSION = '2026-09-02b';
-const BUILD_ID = '2026-09-02-0419';
+const APP_VERSION = '2026-09-02c';
+const BUILD_ID = '2026-09-02-0543';
 const REQUIRED_TABLES = ['cows', 'weights', 'milk_feed', 'starter', 'repro', 'events',
                          'genomics', 'milk_test', 'colostrum', 'pens', 'daily_check',
                          'settings'];
@@ -1399,6 +1395,46 @@ function normalizeCow(c){
  */
 function isWagyu(cow){ return /和牛|黒毛/.test(String(cow && cow.breed || '')); }
 
+/* ------------------------------------------------------------
+   牧場にいるか、出ているか
+   ------------------------------------------------------------
+   和牛は生後1か月ほどで市場に出ます。子牛の一部は預託先（すくすく）へ出て、
+   育成が終わると帰ってきます。出ているあいだは哺乳画面にも見取り図にも
+   出さない。でも記録は消さない — 帰ってきたらそのまま続きを付けたいからです。
+
+   status_date（その状態になった日）を持たせているのは、
+   過去の日を入れ直すときに名簿が変わらないようにするためです。
+   きのう出荷した牛は「きのうの哺乳」には出ませんが、
+   おとといの分を直すときにはちゃんと出ます。
+   ------------------------------------------------------------ */
+const AWAY_STATUS = ['出荷', '預託', '売却', '廃用', '死亡'];
+
+/** 出ている状態か（文字だけを見る。日付は見ない） */
+function isAwayStatus(v){
+  return /出荷|預託|売却|廃用|死亡/.test(String(v || ''));
+}
+
+/**
+ * その日、この牛は牧場にいたか。
+ * onDate を省くと今日。status_date が無い古いデータは、今の状態をそのまま使う。
+ */
+function isOnFarm(cow, onDate){
+  if (!cow) return false;
+  if (!isAwayStatus(cow.status)) return true;
+  const sd = ymd(cow.status_date);
+  if (!sd) return false;                       // 日付が無い＝いつからか分からない → 出ている扱い
+  return ymd(onDate || today()) < sd;          // 出た日より前なら、その日はまだ居た
+}
+
+/** 出ている牛の説明（「預託中（すくすく）」など） */
+function awayLabel(cow){
+  if (!cow || !isAwayStatus(cow.status)) return '';
+  const st = String(cow.status);
+  const d = ymd(cow.status_date);
+  const where = st === '預託' ? (cow.depot || '') : (cow.sale_to || '');
+  return st + (where ? '（' + where + '）' : '') + (d ? ' ' + d : '');
+}
+
 function normBreed(v){
   const s = String(v || '').trim();
   if (!s) return '';
@@ -1708,7 +1744,7 @@ const Calc = {
    */
   groupOf(cow, onDate){
     const S = this.S();
-    if (/売却|廃用|死亡|出荷/.test(String(cow.status || ''))) return GROUPS.sold;
+    if (!isOnFarm(cow, onDate)) return GROUPS.sold;
 
     const parity = num(cow.parity);
     if (parity != null && parity >= 1) return GROUPS.milking;
@@ -3303,12 +3339,17 @@ function viewSearch(){
 function cowRow(c, extra){
   const a = ageDays(c.birth_date);
   const m = ageMonths(c.birth_date);
-  return el('div', { class: 'row', onclick: () => App.openCow(c.cow_no) },
+  // 牧場を出た牛も検索では出す（記録は残っているので）。ただし一目で分かるようにする
+  const away = !isOnFarm(c);
+  return el('div', { class: 'row', style: away ? 'opacity:.62' : '',
+                     onclick: () => App.openCow(c.cow_no) },
     el('div', { class: 'no' }, c.tag4 || '—'),
     el('div', { class: 'mid' },
       el('div', { class: 'l1' },
         c.name || (c.neck_no ? 'ネック ' + c.neck_no : '（名号なし）'),
-        c.breed ? el('span', { class: 'badge', style: 'margin-left:7px' }, c.breed) : null),
+        c.breed ? el('span', { class: 'badge', style: 'margin-left:7px' }, c.breed) : null,
+        away ? el('span', { class: 'badge warn', style: 'margin-left:5px' },
+                 String(c.status)) : null),
       el('div', { class: 'l2' },
         c.birth_date ? fmtDateFull(c.birth_date) + '生' : '生年月日 未登録',
         c.neck_no && c.name ? ' · ネック ' + c.neck_no : '')),
@@ -3484,8 +3525,24 @@ function cowHeader(cow, a){
     cow.breed ? el('span', { class: 'badge b1' }, cow.breed) : null,
     cow.neck_no ? el('span', { class: 'badge' }, 'ネック ' + cow.neck_no) : null,
     a.stage ? el('span', { class: 'badge b2' }, a.stage.label) : null,
-    cow.status ? el('span', { class: 'badge' }, cow.status) : null);
+    isAwayStatus(cow.status) ? null
+      : (cow.status ? el('span', { class: 'badge' }, cow.status) : null));
   if (tags.childNodes.length) c.appendChild(tags);
+
+  // 牧場を出ている牛は、そのことを一番上ではっきり出す。
+  // 記録は残っているので、開いたときに「なぜ哺乳画面に居ないのか」が分かるように。
+  if (isAwayStatus(cow.status)){
+    const away = el('div', { class: 'note warn', style: 'margin-bottom:12px' });
+    away.appendChild(el('div', { style: 'font-weight:700;margin-bottom:4px' },
+      'この牛は牧場にいません — ' + awayLabel(cow)));
+    away.appendChild(el('div', {},
+      cow.sale_price ? '販売価格 ' + Number(cow.sale_price).toLocaleString() + ' 円。' : '',
+      '哺乳画面と見取り図には出ません。記録はそのまま残っています。'));
+    away.appendChild(el('button', { class: 'btn sm', style: 'margin-top:9px',
+      onclick: () => openReturnForm(cow) },
+      String(cow.status) === '預託' ? '牧場に戻す（帰ってきた）' : '取り消して牧場に戻す'));
+    c.appendChild(away);
+  }
 
   // ここには「いちばん先に見たい3つ」だけを置く。
   // 残りは概要タブの「この牛の数字」にまとめてあります。
@@ -3648,7 +3705,15 @@ function tabOverview(v, cow, a){
     el('button', { class: 'btn ' + (weaned ? 'primary ' : '') + 'sm',
       onclick: () => openWeightForm(cow) }, '体重・胸囲'),
     weaned ? el('button', { class: 'btn sm', onclick: () => openReproForm(cow) }, '繁殖') : null));
+  if (isOnFarm(cow))
+    todo.appendChild(el('button', {
+      class: 'btn sm ghost', style: 'width:100%;margin-top:9px;color:var(--muted)',
+      onclick: () => openAwayForm(cow) }, '🚚　牧場から出す（出荷・預託）'));
   v.appendChild(todo);
+
+  /* 三代祖（和牛は最初から出す。ホルスタインは入っていれば出す） */
+  if (isWagyu(cow) || PED_LABELS.some(([k]) => String(cow[k] || '').trim()))
+    v.appendChild(pedigreeCard(cow));
 
   /* 血統 */
   const ped = el('div', { class: 'card' });
@@ -5107,6 +5172,235 @@ function openTransferForm(cow, row){
 }
 
 /* ------------------------------------------------------------
+   牧場を出す・戻す
+   ------------------------------------------------------------
+   和牛は生後1か月ほどで市場へ。子牛の一部は預託先（すくすく）へ出て、
+   育成が終わると帰ってきます。出ているあいだは哺乳画面にも見取り図にも
+   出しませんが、記録は消しません。帰ってきたら続きをそのまま付けられます。
+   ------------------------------------------------------------ */
+
+const AWAY_KINDS = [
+  { key: '出荷', label: '出荷（市場）', hint: '和牛の子牛など。販売価格も残せます', price: true,  where: '出荷先' },
+  { key: '預託', label: '預託（すくすく）', hint: '育成を預ける。帰ってきたら「戻す」で復帰します', price: false, where: '預託先' },
+  { key: '売却', label: '売却',       hint: '個体販売',                    price: true,  where: '売却先' },
+  { key: '死亡', label: '死亡・廃用', hint: '',                            price: false, where: '' }
+];
+
+/** 牧場から出す */
+function openAwayForm(cow, opts){
+  opts = opts || {};
+  let kind = opts.kind || (isWagyu(cow) ? '出荷' : '預託');
+
+  sheet(cow.tag4 + ' を牧場から出す', (b, close) => {
+    const body = el('div');
+    b.appendChild(body);
+
+    const paint = () => {
+      const k = AWAY_KINDS.find(x => x.key === kind) || AWAY_KINDS[0];
+      body.innerHTML = '';
+
+      body.appendChild(el('div', { class: 't-micro',
+        style: 'color:var(--muted);font-weight:700;margin-bottom:5px' }, 'どうして外しますか'));
+      const seg = el('div', { class: 'seg', style: 'margin-bottom:12px' });
+      AWAY_KINDS.forEach(x => seg.appendChild(el('button', {
+        'aria-pressed': kind === x.key,
+        onclick: () => { kind = x.key; paint(); }
+      }, x.label)));
+      body.appendChild(seg);
+      if (k.hint) body.appendChild(el('div', { class: 'hint', style: 'margin:-6px 0 12px' }, k.hint));
+
+      const fDate = inp({ type: 'date', value: today() });
+      body.appendChild(field('出した日', fDate,
+        'この日から哺乳画面に出なくなります。前の日の分を直すときは、ちゃんと出ます。'));
+
+      const fWhere = k.where ? inp({ type: 'text',
+        value: k.key === '預託' ? (cow.depot || 'すくすく') : (cow.sale_to || ''),
+        placeholder: k.key === '預託' ? 'すくすく' : '例 ◯◯家畜市場' }) : null;
+      if (fWhere) body.appendChild(field(k.where, fWhere));
+
+      const fPrice = k.price ? inp({ type: 'number', inputmode: 'numeric', step: '1',
+        value: cow.sale_price || '', placeholder: '例 580000' }) : null;
+      if (fPrice) body.appendChild(field('販売価格 <span class="opt">任意</span>', fPrice, '円（税抜き・手取りなど、牧場の決めた基準で）'));
+
+      const fNote = inp({ type: 'text', value: '', placeholder: '体重・せり番号・備考など' });
+      body.appendChild(field('メモ <span class="opt">任意</span>', fNote));
+
+      const btn = el('button', { class: 'btn primary', style: 'width:100%;margin-top:4px' },
+        kind + 'にする');
+      btn.onclick = () => submitting(btn, async () => {
+        const d = ymd(fDate.value) || today();
+        const where = fWhere ? fWhere.value.trim() : '';
+        const price = fPrice ? String(num(fPrice.value) ?? '') : '';
+        await Store.saveCow({
+          cow_no: cow.cow_no,
+          status: kind,
+          status_date: d,
+          pen: '',                                   // 部屋からも外す
+          depot: kind === '預託' ? where : (cow.depot || ''),
+          sale_to: kind === '預託' ? (cow.sale_to || '') : where,
+          sale_price: price || (cow.sale_price || ''),
+          sale_note: fNote.value.trim() || (cow.sale_note || '')
+        });
+        await Store.add('events', {
+          cow_no: cow.cow_no, date: d, type: kind,
+          detail: [where, price ? r0(price) + '円' : ''].filter(Boolean).join(' ') || kind,
+          note: fNote.value.trim()
+        });
+        MilkBoard.reset(); Analysis.reset();
+        close();
+        toast(cow.tag4 + ' を' + kind + 'にしました');
+        App.render();
+      });
+      body.appendChild(btn);
+    };
+    paint();
+  }, { focus: false });
+}
+
+/** 牧場に戻す（預託から帰ってきた・間違えて外した） */
+function openReturnForm(cow){
+  const wasDepot = String(cow.status || '') === '預託';
+  sheet(cow.tag4 + ' を牧場に戻す', (b, close) => {
+    b.appendChild(el('div', { class: 'note' },
+      wasDepot
+        ? el('span', {}, el('b', {}, '預託先から帰ってきた'), 'ときはこちらです。',
+            'これまでの体重や哺乳の記録は、そのまま続きになります。')
+        : el('span', {}, '間違えて外したときの取り消しにも使えます。')));
+
+    const fDate = inp({ type: 'date', value: today() });
+    b.appendChild(field('戻った日', fDate));
+    const fPen = sel({}, [['', '部屋はあとで決める']]
+      .concat(Pens.all().map(p => [p.name, p.name + '（' + Pens.load(p).n + '頭）'])), '');
+    b.appendChild(field('どの部屋に入れますか <span class="opt">任意</span>', fPen));
+
+    const btn = el('button', { class: 'btn primary', style: 'width:100%' }, '牧場に戻す');
+    btn.onclick = () => submitting(btn, async () => {
+      const d = ymd(fDate.value) || today();
+      await Store.saveCow({ cow_no: cow.cow_no, status: '在籍',
+                            status_date: d, pen: fPen.value });
+      await Store.add('events', {
+        cow_no: cow.cow_no, date: d, type: '帰場',
+        detail: (cow.depot ? cow.depot + ' から' : '') + '牧場へ', note: '' });
+      MilkBoard.reset(); Analysis.reset();
+      close(); toast(cow.tag4 + ' を牧場に戻しました'); App.render();
+    });
+    b.appendChild(btn);
+  }, { focus: false });
+}
+
+/* ------------------------------------------------------------
+   和牛の血統（三代祖）
+   ------------------------------------------------------------
+   和牛では「父・母の父・母の母の父」の3頭で血統を言い表します。
+   市場でも子牛の値段でも、ここが真っ先に見られる所です。
+   ホルスタインでも入れられますが、和牛のカルテにだけ最初から出します。
+   ------------------------------------------------------------ */
+
+const PED_LABELS = [
+  ['ped1', '1代祖（父）',            '種雄牛名。例 安福久'],
+  ['ped2', '2代祖（母の父）',        '例 忠富士'],
+  ['ped3', '3代祖（母の母の父）',    '例 平茂勝']
+];
+
+/** これまでに入力された種雄牛名（打ち直しを減らすための候補） */
+function pedSuggestions(){
+  const seen = new Map();
+  Store.cows.forEach(c => {
+    ['ped1', 'ped2', 'ped3', 'sire_name'].forEach(k => {
+      const v = String(c[k] || '').trim();
+      if (v) seen.set(v, (seen.get(v) || 0) + 1);
+    });
+  });
+  return Array.from(seen.entries()).sort((a, b) => b[1] - a[1]).map(x => x[0]);
+}
+
+function openPedigreeForm(cow){
+  sheet(cow.tag4 + ' の血統', (b, close) => {
+    b.appendChild(el('div', { class: 'hint', style: 'margin:-4px 0 12px' },
+      '父 → 母の父 → 母の母の父 の順です。分かるところだけで構いません。'));
+
+    // 打ち直しを減らすため、これまで入れた名前を候補に出す
+    const listId = 'pedlist';
+    const dl = el('datalist', { id: listId });
+    pedSuggestions().slice(0, 60).forEach(v => dl.appendChild(el('option', { value: v })));
+    b.appendChild(dl);
+
+    const fields = {};
+    PED_LABELS.forEach(([key, label, ph]) => {
+      fields[key] = inp({ type: 'text', value: cow[key] || '', placeholder: ph, list: listId });
+      b.appendChild(field(label, fields[key]));
+    });
+
+    // 母が登録されていれば、母の血統から自動で埋められる
+    const dam = damOf(cow);
+    if (dam && (dam.ped1 || dam.sire_name)){
+      const fill = el('button', { class: 'btn sm ghost', style: 'width:100%;margin-bottom:12px' },
+        '母 ' + dam.tag4 + ' の血統から埋める');
+      fill.onclick = () => {
+        // 子の2代祖＝母の父、子の3代祖＝母の母の父
+        if (!fields.ped2.value) fields.ped2.value = dam.ped1 || dam.sire_name || '';
+        if (!fields.ped3.value) fields.ped3.value = dam.ped2 || '';
+        toast('母の血統から埋めました。確かめてください');
+      };
+      b.appendChild(fill);
+    }
+
+    const btn = el('button', { class: 'btn primary', style: 'width:100%' }, '保存する');
+    btn.onclick = () => submitting(btn, async () => {
+      const row = { cow_no: cow.cow_no };
+      PED_LABELS.forEach(([k]) => { row[k] = fields[k].value.trim(); });
+      // 1代祖は種雄牛名と同じものなので、空いていれば揃えておく
+      if (row.ped1 && !cow.sire_name) row.sire_name = row.ped1;
+      await Store.saveCow(row);
+      close(); toast('血統を保存しました'); App.render();
+    });
+    b.appendChild(btn);
+  }, { focus: false });
+}
+
+/** この牛の母（4桁でも10桁でも引ける） */
+function damOf(cow){
+  const m = String(cow.dam_mgmt_no || '').trim();
+  const n = String(cow.dam_no || '').trim();
+  if (!m && !n) return null;
+  return Store.cows.find(c => (n && c.cow_no === n) || (m && c.tag4 === m)) || null;
+}
+
+/** カルテに出す血統のカード */
+function pedigreeCard(cow){
+  const has = PED_LABELS.some(([k]) => String(cow[k] || '').trim());
+  const c = el('div', { class: 'card' });
+  c.appendChild(el('h2', {}, '血統（三代祖）',
+    el('button', { class: 'btn sm', onclick: () => openPedigreeForm(cow) },
+      has ? '直す' : '＋ 入力')));
+
+  if (!has){
+    c.appendChild(el('div', { class: 'empty', style: 'padding:16px 10px' },
+      '血統が入っていません',
+      el('div', { class: 'hint', style: 'margin-top:6px' },
+        '父・母の父・母の母の父 を入れておくと、市場で聞かれたときにすぐ出せます。')));
+    return c;
+  }
+
+  const line = el('div', { style: 'display:flex;align-items:stretch;gap:0' });
+  PED_LABELS.forEach(([k, label], i) => {
+    const v = String(cow[k] || '').trim();
+    if (i) line.appendChild(el('div', {
+      style: 'align-self:center;color:var(--muted);padding:0 6px;font-size:var(--t2)' }, '›'));
+    line.appendChild(el('div', {
+      style: 'flex:1;min-width:0;background:var(--surface-2);border-radius:var(--r-sm);' +
+             'padding:9px 10px' },
+      el('div', { class: 't-micro', style: 'color:var(--muted)' }, label.replace(/（.*/, '')),
+      el('div', { style: 'font-size:var(--t2);font-weight:700;line-height:1.35;' +
+                         'overflow-wrap:anywhere' }, v || '—')));
+  });
+  c.appendChild(line);
+  c.appendChild(el('div', { class: 't-micro', style: 'color:var(--muted);margin-top:7px' },
+    '父　›　母の父　›　母の母の父'));
+  return c;
+}
+
+/* ------------------------------------------------------------
    10. 入力画面
    ------------------------------------------------------------ */
 /** 大きな行動ボタン（アイコン＋見出し＋補足） */
@@ -5274,7 +5568,7 @@ function preweanCows(){
   const keys = Calc.programKeys();
   const maxD = (keys.length ? Math.max(...keys.map(k => Calc.programMeta(k).weanMax)) : 100) + 10;
   return Store.cows.filter(c => {
-    if (/売却|廃用|死亡|出荷/.test(String(c.status || ''))) return false;
+    if (!isOnFarm(c)) return false;
     const d = ageDays(c.birth_date);
     return d != null && d >= 0 && d <= maxD;
   }).sort((a, b) => ageDays(a.birth_date) - ageDays(b.birth_date));
@@ -7478,15 +7772,27 @@ const MilkBoard = {
   sort: LS.get('sw.mbSort', 'pen'),   // pen（歩く順）| group（群の順）
   showOpts: LS.get('sw.mbOpts', false),   // 並び順と刻みを開いているか
   showRecord: LS.get('sw.mbRec', false),  // 「この牧場のこれまで」を開いているか
+  showAway: LS.get('sw.mbAway', false),   // 出荷・預託で出た牛も出すか
   loaded: false,
 
   reset(){ this.loaded = false; this.loading = false; this.savedLoaded = false;
            this.rows = []; this.date = null; },
 
+  /* 群の判定。
+     「出た牛も出す」にしているときは、出ていないものとして群を見ます。
+     そうしないと全部が「場外」になってしまい、1頭も出てこないためです。 */
+  groupFor(c, date){
+    if (this.showAway && !isOnFarm(c, date))
+      return Calc.groupOf(Object.assign({}, c, { status: '' }), date);
+    return Calc.groupOf(c, date);
+  },
+
   build(){
     const date = this.date || today();
     // 「その日」時点の群で判定する（過去の日を入れ直すときに名簿が変わらないように）
-    const list = Store.cows.filter(c => Calc.groupOf(c, date).milk);
+    // 出荷・預託で牧場を出た牛は出さない（⚙ の「出た牛も出す」で戻せる）
+    const list = Store.cows.filter(c =>
+      this.groupFor(c, date).milk && (this.showAway || isOnFarm(c, date)));
 
     // 並び順は2通り。
     //   pen  … 実際に歩くハッチの順（飛ばし・二度づけが減る）
@@ -7499,14 +7805,14 @@ const MilkBoard = {
     const cows = list.sort((a, b) => byPen
       ? (penOrder(a) - penOrder(b)) ||
         ((ageDays(a.birth_date, date) ?? 0) - (ageDays(b.birth_date, date) ?? 0))
-      : (Calc.groupOf(a, date).order - Calc.groupOf(b, date).order) ||
+      : (this.groupFor(a, date).order - this.groupFor(b, date).order) ||
         ((ageDays(a.birth_date, date) ?? 0) - (ageDays(b.birth_date, date) ?? 0)));
 
     this.rows = cows.map(c => {
       const day = ageDays(c.birth_date, date);
       const key = Calc.programKey(c);
       const prog = Calc.programAt(key, day, date);
-      const g = Calc.groupOf(c, date);
+      const g = this.groupFor(c, date);
       const lw = Store.latestWeight[String(c.cow_no)] || null;
       // 体重は直近の測定を使い、無ければ標準の平均で代用する（%表示の分母）
       const kg = lw ? lw.kg : (Calc.std('weight', day)?.avg ?? null);
@@ -7678,6 +7984,19 @@ function viewMilkBoard(){
 
     head.appendChild(el('hr', { class: 'sep', style: 'margin:12px 0 8px' }));
     head.appendChild(el('div', { class: 't-micro',
+      style: 'color:var(--muted);font-weight:700;margin-bottom:5px' }, '牧場を出た牛'));
+    head.appendChild(el('div', { class: 'seg' },
+      [[false, '出さない'], [true, '出す']].map(([v, t]) => el('button', {
+        'aria-pressed': MilkBoard.showAway === v,
+        onclick: () => { MilkBoard.showAway = v; LS.set('sw.mbAway', v);
+                         MilkBoard.loaded = false; App.render(); }
+      }, t))));
+    head.appendChild(el('div', { class: 'hint' },
+      '出荷（市場）や預託（すくすく）に出した牛のことです。' +
+      'ふだんは出しません。間違えて外したときは「出す」にすると戻せます。'));
+
+    head.appendChild(el('hr', { class: 'sep', style: 'margin:12px 0 8px' }));
+    head.appendChild(el('div', { class: 't-micro',
       style: 'color:var(--muted);font-weight:700;margin-bottom:5px' }, '± ボタンの刻み'));
     head.appendChild(el('div', { class: 'seg' },
       [0.2, 0.3, 0.5, 1, 2].map(v => el('button', {
@@ -7810,6 +8129,7 @@ function milkRow(r){
   const flagged = (r.feces && r.feces !== '正常') || safe.level === 'high';
   // 和牛はホルスタインと哺乳量がまるで違うので、行ごと色で分かるようにする
   const wagyu = isWagyu(r.cow);
+  const away = !isOnFarm(r.cow, MilkBoard.date);
   const box = el('div', {
     style: 'border-bottom:1px solid var(--grid);padding:8px 0' +
            (flagged
@@ -7818,7 +8138,8 @@ function milkRow(r){
                ? ';background:color-mix(in srgb,var(--s2) 6%,transparent);margin:0 -6px;' +
                  'padding-left:9px;padding-right:6px;border-radius:8px;' +
                  'box-shadow:inset 3px 0 0 var(--s2)'
-               : '')
+               : '') +
+           (away ? ';opacity:.5' : '')
   });
 
   const total = (num(r.am, 0) || 0) + (num(r.pm, 0) || 0);
@@ -7843,7 +8164,8 @@ function milkRow(r){
       el('div', { style: 'font-size:var(--t5);font-weight:800;line-height:1.15;' +
                          'font-variant-numeric:tabular-nums' }, r.cow.tag4),
       el('div', { style: 'font-size:var(--t0);color:var(' + (wagyu ? '--s2' : '--muted') + ')' },
-        (wagyu ? '和牛 ' : '') + r.day + '日' + (r.cow.pen ? '　' + r.cow.pen : ''))),
+        away ? awayLabel(r.cow)
+             : (wagyu ? '和牛 ' : '') + r.day + '日' + (r.cow.pen ? '　' + r.cow.pen : ''))),
     el('div', { style: 'flex:1;min-width:0;font-size:var(--t1);color:var(--muted);line-height:1.5' },
       r.prog ? r1(r.prog.perFeed) + ' L/回・粉' + r0(r.prog.powderPerFeed) + 'g' : '',
       r.saved && !r.changed
@@ -7966,6 +8288,14 @@ function milkRow(r){
     el('button', { class: 'btn sm ghost',
       onclick: () => { r.am = r.pm = null; r.refused = ''; r.feces = ''; r.note = '';
                        r.changed = false; App.render(); } }, 'この牛を空に')));
+
+  // 市場に出た・預託に出した牛は、ここから外せます。
+  // 現場でその場で押せるのが大事なので、哺乳画面の中に置いています。
+  det.appendChild(el('button', {
+    class: 'btn sm ghost', style: 'width:100%;margin-top:8px;color:var(--muted)',
+    onclick: () => isOnFarm(r.cow) ? openAwayForm(r.cow) : openReturnForm(r.cow)
+  }, isOnFarm(r.cow) ? '🚚　この牛を牧場から出す（出荷・預託）'
+                     : '↩︎　' + awayLabel(r.cow) + ' — 牧場に戻す'));
 
   box.appendChild(det);
   return box;
