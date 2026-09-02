@@ -414,6 +414,7 @@ figure.chart figcaption{font-size:var(--t1);color:var(--muted);margin-top:8px;li
   width:19px;height:19px;border:2.5px solid var(--grid);border-top-color:var(--s1);
   border-radius:50%;animation:spin .7s linear infinite;display:inline-block
 }
+.spinner.sm{width:12px;height:12px;border-width:2px;vertical-align:-1px}
 @keyframes spin{to{transform:rotate(360deg)}}
 
 .statusdot{width:8px;height:8px;border-radius:50%;background:var(--muted);flex:none}
@@ -840,10 +841,14 @@ const EVENT_TYPES = ['増乳開始','ピーク到達','減乳開始','離乳','�
  *               表や列が増えたときだけ上げる。上げたら Code.gs のデプロイも必要。
  * BUILD_ID     … この index.html を作った日時。作るたびに毎回変わる。
  *               「新しい画面が出ていないか」を見るためだけに使う。
- *               build.sh が 2026-09-01-0838 を実際の日時に置き換えます。
+ *               build.sh が 2026-09-02-0335 を実際の日時に置き換えます。
  */
-const APP_VERSION = '2026-09-01a';
-const BUILD_ID = '2026-09-01-0838';
+/* カルテを開いた瞬間に要る表と、タブを開いたときでいい表 */
+const COW_CORE_TABLES = ['weights', 'milk_feed', 'starter', 'repro', 'events', 'colostrum'];
+const COW_LAZY_TABLES = ['genomics', 'milk_test'];
+
+const APP_VERSION = '2026-09-02a';
+const BUILD_ID = '2026-09-02-0335';
 const REQUIRED_TABLES = ['cows', 'weights', 'milk_feed', 'starter', 'repro', 'events',
                          'genomics', 'milk_test', 'colostrum', 'pens', 'daily_check',
                          'settings'];
@@ -965,10 +970,13 @@ const Store = {
                            colostrum: (db.colostrum || []).length } };
       case 'cow': {
         const no = String(p.cow_no);
-        const f = t => db[t].filter(r => String(r.cow_no) === no);
-        return { weights: f('weights'), milk_feed: f('milk_feed'), starter: f('starter'),
-                 repro: f('repro'), events: f('events'), genomics: f('genomics'),
-                 milk_test: f('milk_test'), colostrum: f('colostrum') };
+        const f = t => (db[t] || []).filter(r => String(r.cow_no) === no);
+        const want = (p.tables && p.tables.length)
+          ? p.tables
+          : COW_CORE_TABLES.concat(COW_LAZY_TABLES);
+        const out = {};
+        want.forEach(t => { out[t] = f(t); });
+        return out;
       }
       case 'saveCow': {
         const row = stamp(p.row);
@@ -1110,15 +1118,39 @@ const Store = {
     return d;
   },
 
-  async cow(no){
+  /* ------------------------------------------------------------
+     1頭ぶんのカルテを取りに行く
+     ------------------------------------------------------------
+     以前は8つの表をぜんぶ持ってきていました。そのうちゲノムは牧場全体で
+     3,000行以上あり、これを読むのに一番時間がかかっていました。
+     でも最初の画面に要るのは体重・哺乳・スターター・繁殖・記録・初乳だけです。
+     ゲノムと乳検は、そのタブを開いたときに取りに行きます。
+     ------------------------------------------------------------ */
+  async cow(no, opts){
+    opts = opts || {};
     const key = String(no);
-    if (this.cache[key]) return this.cache[key];
-    const d = await this.call({ action: 'cow', cow_no: key });
-    ['weights','milk_feed','starter','repro','events','genomics','milk_test','colostrum'].forEach(t => {
-      d[t] = (d[t] || []).slice().sort((a,b) => String(a.date) < String(b.date) ? -1 : 1);
+    const want = opts.tables || COW_CORE_TABLES;
+    const have = this.cache[key];
+    const missing = want.filter(t => !have || !have[t]);
+    if (!missing.length) return have;
+
+    const d = await this.call({ action: 'cow', cow_no: key, tables: missing });
+    const rec = have || {};
+    // 返ってきたものは全部しまう（古いバックエンドは頼んでいない表も返してくる）
+    Object.keys(d).forEach(t => {
+      rec[t] = (d[t] || []).slice().sort((a,b) => String(a.date) < String(b.date) ? -1 : 1);
     });
-    this.cache[key] = d;
-    return d;
+    missing.forEach(t => { if (!rec[t]) rec[t] = []; });
+    this.cache[key] = rec;
+    return rec;
+  },
+
+  /** タップされる前に、そっと先に取りに行っておく（失敗しても何も言わない） */
+  warm(no){
+    const key = String(no);
+    if (!key || this.cache[key] || this._warming === key) return;
+    this._warming = key;
+    this.cow(key).catch(() => {}).then(() => { if (this._warming === key) this._warming = null; });
   },
 
   invalidate(no){ if (no != null) delete this.cache[String(no)]; },
@@ -3194,6 +3226,9 @@ function viewSearch(){
       App.openCow(found[0].cow_no);
       return;
     }
+    // タップされるより先に、いちばん上の牛の記録を取りに行っておく。
+    // 押したときには、もう手元にあることが多くなります。
+    if (found.length) Store.warm(found[0].cow_no);
     found.slice(0, 24).forEach(c => hits.appendChild(cowRow(c)));
   }
 
@@ -3322,19 +3357,10 @@ async function viewCow(container){
     [cow.breed, cow.neck_no ? 'ネック ' + cow.neck_no : null,
      cow.birth_date ? ageDays(cow.birth_date) + '日齢' : null].filter(Boolean).join(' · '), true);
 
-  container.appendChild(el('div', { class: 'empty' }, el('div', { class: 'spinner' })));
-
-  let rec;
-  try { rec = await Store.cow(cow.cow_no); }
-  catch (e){
-    container.innerHTML = '';
-    container.appendChild(el('div', { class: 'note crit' }, e.message));
-    return;
-  }
-  const a = Calc.analyze(cow, rec);
-
-  container.innerHTML = '';
-  container.appendChild(cowHeader(cow, a));
+  /* 待たせないための組み立て。
+     4桁・日齢・いまの体重は、もう手元にあるので先に出します。
+     記録の読み込みを待つあいだ、真っ白な画面を見せないためです。 */
+  container.appendChild(quickHeader(cow));
 
   const tabs = el('div', { class: 'tabs' });
   COW_TABS.forEach(([k, label]) => tabs.appendChild(el('button', {
@@ -3343,12 +3369,52 @@ async function viewCow(container){
   }, label)));
   container.appendChild(tabs);
 
-  const body = el('div');
+  const body = el('div', {}, el('div', { class: 'empty' }, el('div', { class: 'spinner' })));
   container.appendChild(body);
+
+  let rec;
+  try { rec = await Store.cow(cow.cow_no); }
+  catch (e){
+    body.innerHTML = '';
+    body.appendChild(el('div', { class: 'note crit' }, e.message));
+    return;
+  }
+  // 途中で別の牛に移っていたら、もう描かない
+  if (String(App.cowNo) !== String(cow.cow_no) || !container.isConnected) return;
+
+  const a = Calc.analyze(cow, rec);
+  container.replaceChild(cowHeader(cow, a), container.firstChild);
+
+  body.innerHTML = '';
   ({
     overview: tabOverview, milk: tabMilk, weight: tabWeight,
     repro: tabRepro, genome: tabGenome, milktest: tabMilkTest, log: tabLog
   }[App.tab] || tabOverview)(body, cow, a);
+}
+
+/**
+ * 記録が届く前に出しておく、仮の見出し。
+ * 手元にある情報（4桁・名号・日齢・いちばん新しい体重）だけで作ります。
+ * 中身が届いたら、そのまま本物の見出しに差し替わります。
+ */
+function quickHeader(cow){
+  const c = el('div', { class: 'card' });
+  const d = ageDays(cow.birth_date);
+  const w = Store.latestWeight[String(cow.cow_no)];
+  c.appendChild(el('div', { style: 'display:flex;align-items:flex-start;gap:14px' },
+    el('div', { style: 'flex:none' },
+      el('div', { style: 'font-size:calc(38px * var(--fs));font-weight:800;line-height:1.05;' +
+                         'font-variant-numeric:tabular-nums' }, cow.tag4 || '—'),
+      el('div', { style: 'font-size:var(--t0);color:var(--muted);margin-top:2px' },
+        fmtEarTag(cow.cow_no))),
+    el('div', { style: 'flex:1;min-width:0;font-size:var(--t1);color:var(--ink-2);line-height:1.7' },
+      el('div', {}, cow.name || '　'),
+      el('div', { style: 'color:var(--muted)' },
+        [cow.breed, d != null ? d + '日齢' : null,
+         w ? 'およそ ' + r0(w.kg) + ' kg' : null].filter(Boolean).join(' · ')))));
+  c.appendChild(el('div', { class: 'hint', style: 'margin-top:10px' },
+    el('span', { class: 'spinner sm' }), ' 記録を読み込んでいます…'));
+  return c;
 }
 
 function cowHeader(cow, a){
@@ -3563,17 +3629,33 @@ function tabOverview(v, cow, a){
   kv('父・精液', [cow.sire_code, cow.sire_name].filter(Boolean).join(' ') || '未登録');
   ped.appendChild(dl);
 
-  const g = a.rec.genomics || [];
-  if (g.length){
-    ped.appendChild(el('hr', { class: 'sep' }));
-    ped.appendChild(genomeHighlight(g));
-    ped.appendChild(el('button', { class: 'btn ghost sm', style: 'margin-top:10px',
-      onclick: () => { App.tab = 'genome'; App.render(); } }, 'ゲノムの全項目を見る →'));
-  } else {
-    ped.appendChild(el('div', { class: 'hint', style: 'margin-top:10px' },
-      'この牛のゲノム値は登録されていません。'));
-  }
+  /* ゲノムは行数が多く、読むのに時間がかかるので、
+     ここだけ後から埋めます（この欄を待って画面全体が止まらないように）。 */
+  const gslot = el('div', {}, el('div', { class: 'hint', style: 'margin-top:10px' },
+    el('span', { class: 'spinner sm' }), ' ゲノムを読み込んでいます…'));
+  ped.appendChild(gslot);
   v.appendChild(ped);
+
+  Store.cow(cow.cow_no, { tables: ['genomics'] }).then(rec2 => {
+    if (String(App.cowNo) !== String(cow.cow_no) || !gslot.isConnected) return;
+    const g = rec2.genomics || [];
+    a.rec.genomics = g;
+    gslot.innerHTML = '';
+    if (g.length){
+      gslot.appendChild(el('hr', { class: 'sep' }));
+      gslot.appendChild(genomeHighlight(g));
+      gslot.appendChild(el('button', { class: 'btn ghost sm', style: 'margin-top:10px',
+        onclick: () => { App.tab = 'genome'; App.render(); } }, 'ゲノムの全項目を見る →'));
+    } else {
+      gslot.appendChild(el('div', { class: 'hint', style: 'margin-top:10px' },
+        'この牛のゲノム値は登録されていません。'));
+    }
+  }).catch(() => {
+    if (!gslot.isConnected) return;
+    gslot.innerHTML = '';
+    gslot.appendChild(el('div', { class: 'hint', style: 'margin-top:10px' },
+      'ゲノムを読み込めませんでした。'));
+  });
 
   /* 繁殖のサマリー（初回分娩まで） */
   if (a.ageMonths != null && a.ageMonths >= 8) v.appendChild(reproSummaryCard(cow, a));
@@ -4014,6 +4096,20 @@ function genomeTable(rows, opts){
 }
 
 function tabGenome(v, cow, a){
+  // ゲノムはここで初めて要る表。まだ手元に無ければ読み込んでから描き直す。
+  if (!a.rec.genomics){
+    v.appendChild(el('div', { class: 'empty' }, el('div', { class: 'spinner' }),
+      el('div', { style: 'margin-top:12px' }, 'ゲノムを読み込んでいます…')));
+    Store.cow(cow.cow_no, { tables: ['genomics'] }).then(rec2 => {
+      if (String(App.cowNo) !== String(cow.cow_no) || App.tab !== 'genome') return;
+      a.rec.genomics = rec2.genomics || [];
+      v.innerHTML = ''; tabGenome(v, cow, a);
+    }).catch(e => {
+      v.innerHTML = '';
+      v.appendChild(el('div', { class: 'note crit' }, e.message || String(e)));
+    });
+    return;
+  }
   const g = a.rec.genomics || [];
   const c = el('div', { class: 'card' });
   c.appendChild(el('h2', {}, 'ゲノム情報',
@@ -4063,7 +4159,7 @@ async function damGenomeInto(container, dam, childRows){
   const slot = el('div', {}, el('span', { class: 'spinner' }));
   container.appendChild(slot);
   let rec;
-  try { rec = await Store.cow(dam.cow_no); }
+  try { rec = await Store.cow(dam.cow_no, { tables: ['genomics'] }); }
   catch (e){ slot.innerHTML = ''; slot.appendChild(el('div', { class: 'note crit' }, e.message)); return; }
   const dg = (rec.genomics || []).filter(x => String(x.subject || '自身') === '自身');
   slot.innerHTML = '';
@@ -4097,6 +4193,19 @@ async function damGenomeInto(container, dam, childRows){
 
 /* --------------------------- 乳検 --------------------------- */
 function tabMilkTest(v, cow, a){
+  if (!a.rec.milk_test){
+    v.appendChild(el('div', { class: 'empty' }, el('div', { class: 'spinner' }),
+      el('div', { style: 'margin-top:12px' }, '乳検を読み込んでいます…')));
+    Store.cow(cow.cow_no, { tables: ['milk_test'] }).then(rec2 => {
+      if (String(App.cowNo) !== String(cow.cow_no) || App.tab !== 'milktest') return;
+      a.rec.milk_test = rec2.milk_test || [];
+      v.innerHTML = ''; tabMilkTest(v, cow, a);
+    }).catch(e => {
+      v.innerHTML = '';
+      v.appendChild(el('div', { class: 'note crit' }, e.message || String(e)));
+    });
+    return;
+  }
   const rows = (a.rec.milk_test || []).slice()
     .sort((x, y) => String(x.date) < String(y.date) ? 1 : -1);
   const c = el('div', { class: 'card' });
