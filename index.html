@@ -837,14 +837,14 @@ const EVENT_TYPES = ['増乳開始','ピーク到達','減乳開始','離乳','�
  *               表や列が増えたときだけ上げる。上げたら Code.gs のデプロイも必要。
  * BUILD_ID     … この index.html を作った日時。作るたびに毎回変わる。
  *               「新しい画面が出ていないか」を見るためだけに使う。
- *               build.sh が 2026-09-02-0543 を実際の日時に置き換えます。
+ *               build.sh が 2026-09-02-0653 を実際の日時に置き換えます。
  */
 /* カルテを開いた瞬間に要る表と、タブを開いたときでいい表 */
 const COW_CORE_TABLES = ['weights', 'milk_feed', 'starter', 'repro', 'events', 'colostrum'];
 const COW_LAZY_TABLES = ['genomics', 'milk_test'];
 
 const APP_VERSION = '2026-09-02c';
-const BUILD_ID = '2026-09-02-0543';
+const BUILD_ID = '2026-09-02-0653';
 const REQUIRED_TABLES = ['cows', 'weights', 'milk_feed', 'starter', 'repro', 'events',
                          'genomics', 'milk_test', 'colostrum', 'pens', 'daily_check',
                          'settings'];
@@ -5709,7 +5709,7 @@ function viewBulk(kind){
 /* ------------------------------------------------------------
    11. 牛群一覧
    ------------------------------------------------------------ */
-let herdFilter = { breed: '', group: '', alert: false };
+let herdFilter = { breed: '', group: '', alert: false, away: '' };
 let herdLimit = 50;
 
 /** その牛でいま気にすべきこと。「今日」画面と牛群一覧で同じ判定を使います */
@@ -5812,7 +5812,7 @@ function viewHerd(){
       style: 'display:flex;align-items:center;gap:11px;padding:5px 0;cursor:pointer;' +
              'min-height:var(--tap-sm)',
       onclick: () => { herdFilter.group = herdFilter.group === g.key ? '' : g.key;
-                       herdLimit = 50; App.render(); }
+                       herdFilter.away = ''; herdLimit = 50; App.render(); }
     },
       el('div', { style: 'min-width:104px;font-size:calc(12.5px * var(--fs));font-weight:' +
         (herdFilter.group === g.key ? '700' : '500') }, g.label),
@@ -5824,6 +5824,10 @@ function viewHerd(){
   gc.appendChild(el('div', { class: 'hint', style: 'margin-top:8px' },
     '群をタップするとその群だけを一覧に出します。'));
   wrap.appendChild(gc);
+
+  /* --- 牧場を出ている牛（預託・出荷） --- */
+  const awayCard = awayGroupsCard(rows);
+  if (awayCard) wrap.appendChild(awayCard);
 
   /* --- 牛舎の配置 --- */
   const nPens = Pens.all().length;
@@ -5883,9 +5887,11 @@ function viewHerd(){
   const chip = (label, on, fn) => el('button', { class: 'chip', 'aria-pressed': on,
     onclick: () => { fn(); herdLimit = 50; App.render(); } }, label);
   fc.appendChild(el('div', { class: 'chips', style: 'margin-bottom:8px' },
-    chip('在籍すべて', herdFilter.group === '', () => herdFilter.group = ''),
+    chip('在籍すべて', herdFilter.group === '' && !herdFilter.away,
+         () => { herdFilter.group = ''; herdFilter.away = ''; }),
     GROUP_LIST.filter(g => g.key !== 'unknown').map(g =>
-      chip(g.short, herdFilter.group === g.key, () => herdFilter.group = g.key))));
+      chip(g.short, herdFilter.group === g.key && !herdFilter.away,
+           () => { herdFilter.group = g.key; herdFilter.away = ''; }))));
   fc.appendChild(el('div', { class: 'chips' },
     chip('全品種', herdFilter.breed === '', () => herdFilter.breed = ''),
     breeds.map(b => chip(b, herdFilter.breed === b, () => herdFilter.breed = b)),
@@ -5895,6 +5901,8 @@ function viewHerd(){
   /* --- 一覧 --- */
   let list = rows.filter(r => {
     if (herdFilter.breed && r.c.breed !== herdFilter.breed) return false;
+    // 「すくすく」など、牧場を出ている牛だけを見ているとき
+    if (herdFilter.away) return awayKeyOf(r.c) === herdFilter.away;
     if (herdFilter.group) return r.g.key === herdFilter.group;
     return r.g.key !== 'sold';
   });
@@ -5902,7 +5910,13 @@ function viewHerd(){
   list.sort((a, b) => (a.g.order - b.g.order) || ((a.d ?? 999999) - (b.d ?? 999999)));
 
   const lc = el('div', { class: 'card' });
-  lc.appendChild(el('h2', {}, '個体一覧', el('span', { class: 'note' }, list.length + '頭')));
+  lc.appendChild(el('h2', {},
+    herdFilter.away ? herdFilter.away + ' の牛' : '個体一覧',
+    el('span', { class: 'note' }, list.length + '頭')));
+  if (herdFilter.away)
+    lc.appendChild(el('button', { class: 'btn sm ghost', style: 'margin-bottom:10px',
+      onclick: () => { herdFilter.away = ''; herdLimit = 50; App.render(); } },
+      '← 在籍の牛にもどる'));
   if (!list.length){
     lc.appendChild(el('div', { class: 'empty' }, '該当する牛がいません'));
   } else {
@@ -6145,6 +6159,90 @@ async function toggleCheck(slot, item, on){
                                      operator: Store.cfg.user || '' });
     App.render();
   } catch (e){ toast(e.message || String(e), true); }
+}
+
+/* ------------------------------------------------------------
+   牧場を出ている牛（預託・出荷）
+   ------------------------------------------------------------
+   すくすくに預けている子は、哺乳画面にも見取り図にも出ません。
+   でも「いま何頭あずけているか」「いつ帰ってくるか」は知りたい。
+   なので牛群のようすに、行き先ごとの箱を出します。
+   ------------------------------------------------------------ */
+
+/** その牛の行き先を1つの見出しにまとめる（すくすく / 出荷 / 死亡 …） */
+function awayKeyOf(cow){
+  if (!isAwayStatus(cow.status)) return '';
+  const st = String(cow.status);
+  if (st === '預託') return String(cow.depot || '').trim() || '預託';
+  if (st === '出荷' || st === '売却'){
+    const to = String(cow.sale_to || '').trim();
+    return to ? st + '・' + to : st;
+  }
+  return st;
+}
+
+function awayGroupsCard(rows){
+  const away = rows.filter(r => isAwayStatus(r.c.status));
+  if (!away.length) return null;
+
+  // 行き先ごとにまとめる。預託を先に、出荷・売却、そのほかの順。
+  const buckets = new Map();
+  away.forEach(r => {
+    const k = awayKeyOf(r.c) || 'そのほか';
+    if (!buckets.has(k)) buckets.set(k, []);
+    buckets.get(k).push(r);
+  });
+  const rank = k => {
+    const st = k => away.find(r => (awayKeyOf(r.c) || 'そのほか') === k);
+    const s = st(k) ? String(st(k).c.status) : '';
+    return s === '預託' ? 0 : (s === '出荷' ? 1 : (s === '売却' ? 2 : 3));
+  };
+  const keys = Array.from(buckets.keys()).sort((a, b) => (rank(a) - rank(b)) || (a < b ? -1 : 1));
+
+  const c = el('div', { class: 'card' });
+  c.appendChild(el('h2', {}, '牧場を出ている牛',
+    el('span', { class: 'note' }, away.length + '頭')));
+
+  keys.forEach(k => {
+    const list = buckets.get(k);
+    const st = String(list[0].c.status);
+    const depot = st === '預託';
+    // 預託は帰ってくるので、いちばん古い子が何日あずかられているかを添える
+    const days = list
+      .map(r => { const d = ymd(r.c.status_date); return d ? daysBetween(d, today()) : null; })
+      .filter(v => v != null);
+    const sum = depot && days.length
+      ? 'あずけて ' + Math.min(...days) + '〜' + Math.max(...days) + '日'
+      : null;
+    // 出荷は金額をまとめる（入っているぶんだけ）
+    const prices = list.map(r => num(r.c.sale_price)).filter(v => v != null && v > 0);
+    const money = !depot && prices.length
+      ? prices.reduce((a, b) => a + b, 0).toLocaleString() + ' 円' +
+        (prices.length < list.length ? '（' + prices.length + '頭ぶん）' : '')
+      : null;
+
+    c.appendChild(el('div', {
+      class: 'row', style: 'cursor:pointer',
+      onclick: () => { herdFilter.away = k; herdFilter.group = '';
+                       herdLimit = 50; App.render(); }
+    },
+      el('div', { style: 'min-width:52px;font-size:var(--t5);font-weight:800;' +
+                         'font-variant-numeric:tabular-nums;color:var(' +
+                         (depot ? '--s3' : '--muted') + ')' }, String(list.length)),
+      el('div', { class: 'mid' },
+        el('div', { class: 'l1' }, k,
+          el('span', { class: 'badge' + (depot ? ' b1' : ''), style: 'margin-left:7px' }, st)),
+        el('div', { class: 'l2' },
+          [sum, money].filter(Boolean).join('　') ||
+          list.slice(0, 6).map(r => r.c.tag4).join('、') +
+            (list.length > 6 ? ' ほか' : ''))),
+      el('div', { class: 'rt' }, '›')));
+  });
+
+  c.appendChild(el('div', { class: 'hint', style: 'margin-top:8px' },
+    '行き先をタップすると、その牛だけを下の一覧に出します。' +
+    '預託から帰ってきたら、その牛のカルテで「牧場に戻す」を押してください。'));
+  return c;
 }
 
 /* ------------------------------------------------------------
