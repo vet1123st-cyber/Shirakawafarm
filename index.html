@@ -861,14 +861,14 @@ const EVENT_TYPES = ['増乳開始','ピーク到達','減乳開始','離乳','�
  *               表や列が増えたときだけ上げる。上げたら Code.gs のデプロイも必要。
  * BUILD_ID     … この index.html を作った日時。作るたびに毎回変わる。
  *               「新しい画面が出ていないか」を見るためだけに使う。
- *               build.sh が 2026-09-06-0335 を実際の日時に置き換えます。
+ *               build.sh が 2026-09-06-0401 を実際の日時に置き換えます。
  */
 /* カルテを開いた瞬間に要る表と、タブを開いたときでいい表 */
 const COW_CORE_TABLES = ['weights', 'milk_feed', 'starter', 'repro', 'events', 'colostrum'];
 const COW_LAZY_TABLES = ['genomics', 'milk_test'];
 
-const APP_VERSION = '2026-09-02c';
-const BUILD_ID = '2026-09-06-0335';
+const APP_VERSION = '2026-09-06a';
+const BUILD_ID = '2026-09-06-0401';
 const REQUIRED_TABLES = ['cows', 'weights', 'milk_feed', 'starter', 'repro', 'events',
                          'genomics', 'milk_test', 'colostrum', 'pens', 'daily_check',
                          'settings'];
@@ -881,7 +881,7 @@ const Store = {
   settings: {},
   cows: [],
   benchmark: null,
-  counts: {},
+  _counts: null,      // 各表の件数（設定画面で数えたら覚えておく）
   recentEvents: {},   // cow_no -> 直近21日のイベント
   todayMilk: new Set(),      // 今日すでに哺乳を入力した牛
   colostrumDone: new Set(),  // 初乳を飲ませた記録がある牛
@@ -1018,6 +1018,12 @@ const Store = {
           { updated_at: new Date().toISOString() });
         this.saveLocal(); return db[p.table][i];
       }
+      case 'counts': {
+        const n = t => (db[t] || []).length;
+        return { cows: n('cows'), weights: n('weights'), milk_feed: n('milk_feed'),
+                 starter: n('starter'), repro: n('repro'), milk_test: n('milk_test'),
+                 genomics: n('genomics'), colostrum: n('colostrum') };
+      }
       case 'cowsBulk': {
         const want = (p.tables && p.tables.length) ? p.tables : COW_CORE_TABLES;
         const out = {};
@@ -1096,6 +1102,14 @@ const Store = {
           const d = String(p.date).slice(0, 10);
           rows = rows.filter(r => String(r.date || '').slice(0, 10) === d);
         }
+        if (p.from || p.to){
+          const f = String(p.from || '0000-00-00').slice(0, 10);
+          const t = String(p.to || '9999-99-99').slice(0, 10);
+          rows = rows.filter(r => {
+            const d2 = String(r.date || '').slice(0, 10);
+            return !d2 || (d2 >= f && d2 <= t);
+          });
+        }
         return { table: p.table, rows };
       }
       default: throw new Error('不明な操作: ' + p.action);
@@ -1103,13 +1117,46 @@ const Store = {
   },
 
   /* --- 起動 --- */
-  async init(){
-    this.loading = true;
-    const d = await this.call({ action: 'init' });
+  /* ------------------------------------------------------------
+     起動を待たせない
+     ------------------------------------------------------------
+     スプレッドシートとの1往復には、どうしても数秒かかります。
+     そのあいだ真っ白な画面で待たせるのをやめ、
+     前回この端末で読んだ内容をすぐ出してから、裏で最新に差し替えます。
+
+     ・見えるのは前回の内容なので、上に「最新にしています…」を出します
+     ・接続先（URL）が違うときや、画面の版が変わったときは使いません
+     ・localStorage が使えない端末では、今までどおり待つだけです
+     ------------------------------------------------------------ */
+  cacheKey(){ return 'sw.init.' + BUILD_ID + '.' + (this.cfg.url || 'local'); },
+
+  /** 前回の内容を保存しておく（大きすぎるときはあきらめる） */
+  saveInitCache(d){
+    if (!this.isRemote) return;
+    try {
+      const txt = JSON.stringify({ at: new Date().toISOString(), d });
+      if (txt.length > 3000000) return;
+      localStorage.setItem(this.cacheKey(), txt);
+    } catch (e){ /* いっぱいなら黙って捨てる */ }
+  },
+
+  /** 前回の内容を読み出す。無ければ null */
+  loadInitCache(){
+    if (!this.isRemote) return null;
+    try {
+      const txt = localStorage.getItem(this.cacheKey());
+      if (!txt) return null;
+      const o = JSON.parse(txt);
+      return (o && o.d) ? o : null;
+    } catch (e){ return null; }
+  },
+
+  /** 受け取った内容を画面用に組み立てる（通信と保存から切り離してある） */
+  apply(d){
     this.cows = (d.cows || []).map(normalizeCow);
     this.settings = Object.assign({}, DEFAULTS, d.settings || {});
     this.benchmark = d.benchmark || null;
-    this.counts = d.counts || {};
+    // counts（各表の件数）は起動では受け取りません。Store.counts() で必要なときに数えます。
     // 直近のイベントを牛ごとに引けるようにしておく
     this.recentEvents = {};
     (d.recentEvents || []).forEach(e => {
@@ -1145,9 +1192,35 @@ const Store = {
       this.missingTables = [];
     }
 
-    this.cache = {};
     this.loading = false;
     return d;
+  },
+
+  async init(){
+    this.loading = true;
+    const d = await this.call({ action: 'init' });
+    this.apply(d);
+    this.cache = {};          // 個体ごとの控えは取り直す
+    this.fromCache = false;
+    this.saveInitCache(d);
+    return d;
+  },
+
+  /** 前回の内容で、とりあえず画面を出す。使えたら true */
+  initFromCache(){
+    const o = this.loadInitCache();
+    if (!o) return false;
+    this.apply(o.d);
+    this.fromCache = true;
+    this.cachedAt = o.at;
+    return true;
+  },
+
+  /** 表の件数（設定画面でだけ使う。起動では取りに行かない） */
+  async counts(){
+    if (this._counts) return this._counts;
+    this._counts = await this.call({ action: 'counts' });
+    return this._counts;
   },
 
   /* ------------------------------------------------------------
@@ -2708,10 +2781,16 @@ const Chart = {
       }
       if (s.dots){
         pts.forEach(p => {
+          if (p.x < x0 || p.x > x1) return;
           const surf = cssVar('--surface');
-          svg.appendChild(sv('circle', { cx: X(p.x), cy: Y(p.y), r: p.big ? 6 : 4.5,
-            fill: p.hollow ? surf : s.color, stroke: p.hollow ? s.color : surf,
-            'stroke-width': 2 }));
+          // 点ごとに色と大きさを変えられる。
+          // 便が乱れた日だけ色を変えて少し大きくする、といった使い方をします。
+          const col = p.color || s.color;
+          const rr = p.r || (p.big ? 6 : 4.5);
+          // 小さい点まで太い白フチを付けると、線が破線に見えてしまう
+          svg.appendChild(sv('circle', { cx: X(p.x), cy: Y(p.y), r: rr,
+            fill: p.hollow ? surf : col, stroke: p.hollow ? col : surf,
+            'stroke-width': rr < 3.2 ? 0.8 : 2 }));
         });
       }
     });
@@ -3173,6 +3252,213 @@ const XlsxLite = {
 };
 
 /* ------------------------------------------------------------
+   5c. Excel(.xlsx) の書き出し — 外部ライブラリなし
+   ------------------------------------------------------------
+   .xlsx は中身がZIPです。圧縮なし（stored）でも正しいxlsxになるので、
+   ここではZIPを自前で組み立てています。
+   文字列は sharedStrings を使わず inlineStr にしてあります。
+   そのぶんファイルは少し大きくなりますが、
+   どの端末のブラウザでも確実に作れるほうを取りました。
+   ------------------------------------------------------------ */
+const XlsxOut = {
+
+  /** CRC32（ZIPに必要）。表を作るのは1回きりです。 */
+  _table: null,
+  crc32(u8){
+    if (!this._table){
+      const t = new Uint32Array(256);
+      for (let i = 0; i < 256; i++){
+        let c = i;
+        for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+        t[i] = c >>> 0;
+      }
+      this._table = t;
+    }
+    let c = 0xFFFFFFFF;
+    for (let i = 0; i < u8.length; i++) c = this._table[(c ^ u8[i]) & 0xFF] ^ (c >>> 8);
+    return (c ^ 0xFFFFFFFF) >>> 0;
+  },
+
+  _esc(v){
+    return String(v)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      // Excel が受け付けない制御文字は落とす
+      .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, '');
+  },
+
+  /** 列番号 → A, B, … AA */
+  _col(n){
+    let s = '';
+    n += 1;
+    while (n > 0){ const m = (n - 1) % 26; s = String.fromCharCode(65 + m) + s; n = (n - m - 1) / 26; }
+    return s;
+  },
+
+  /** 1シートぶんのXML。rows は [[値,…],…]、1行目が見出し */
+  _sheetXml(rows, widths){
+    const body = rows.map((r, ri) => {
+      const cells = r.map((v, ci) => {
+        const ref = this._col(ci) + (ri + 1);
+        if (v == null || v === '') return '';
+        // 数字らしいものは数値として入れる（Excelで計算・グラフに使えるように）
+        if (ri > 0 && typeof v === 'number' && isFinite(v))
+          return `<c r="${ref}"><v>${v}</v></c>`;
+        return `<c r="${ref}" t="inlineStr"${ri === 0 ? ' s="1"' : ''}` +
+               `><is><t xml:space="preserve">${this._esc(v)}</t></is></c>`;
+      }).join('');
+      return `<row r="${ri + 1}">${cells}</row>`;
+    }).join('');
+    const cols = (widths || []).map((w, i) =>
+      `<col min="${i + 1}" max="${i + 1}" width="${w}" customWidth="1"/>`).join('');
+    return '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+      '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">' +
+      (cols ? '<cols>' + cols + '</cols>' : '') +
+      '<sheetData>' + body + '</sheetData></worksheet>';
+  },
+
+  /** シート名に使えない文字を落とす（Excelの決まり） */
+  _sheetName(s, i){
+    let n = String(s || ('シート' + (i + 1))).replace(/[\\\/\?\*\[\]:]/g, '_').slice(0, 31);
+    return n || ('シート' + (i + 1));
+  },
+
+  /**
+   * sheets = [{ name, rows:[[...]], widths:[数値…] }]
+   * → Blob（.xlsx）
+   */
+  async build(sheets){
+    const enc = new TextEncoder();
+    const names = sheets.map((s, i) => this._sheetName(s.name, i));
+
+    const files = [];
+    const add = (path, text) => files.push({ path, data: enc.encode(text) });
+
+    add('[Content_Types].xml',
+      '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+      '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">' +
+      '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>' +
+      '<Default Extension="xml" ContentType="application/xml"/>' +
+      '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>' +
+      '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>' +
+      sheets.map((s, i) => `<Override PartName="/xl/worksheets/sheet${i+1}.xml" ` +
+        'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>').join('') +
+      '</Types>');
+
+    add('_rels/.rels',
+      '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+      '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
+      '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>' +
+      '</Relationships>');
+
+    add('xl/workbook.xml',
+      '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+      '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" ' +
+      'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>' +
+      names.map((n, i) => `<sheet name="${this._esc(n)}" sheetId="${i+1}" r:id="rId${i+1}"/>`).join('') +
+      '</sheets></workbook>');
+
+    add('xl/_rels/workbook.xml.rels',
+      '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+      '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
+      sheets.map((s, i) => `<Relationship Id="rId${i+1}" ` +
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" ' +
+        `Target="worksheets/sheet${i+1}.xml"/>`).join('') +
+      `<Relationship Id="rId${sheets.length+1}" ` +
+      'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>' +
+      '</Relationships>');
+
+    // 見出し行を太字にするためだけの、最小の書式
+    add('xl/styles.xml',
+      '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+      '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">' +
+      '<fonts count="2"><font><sz val="11"/><name val="Calibri"/></font>' +
+      '<font><b/><sz val="11"/><name val="Calibri"/></font></fonts>' +
+      '<fills count="1"><fill><patternFill patternType="none"/></fill></fills>' +
+      '<borders count="1"><border/></borders>' +
+      '<cellStyleXfs count="1"><xf/></cellStyleXfs>' +
+      '<cellXfs count="2"><xf xfId="0"/><xf fontId="1" applyFont="1" xfId="0"/></cellXfs>' +
+      '</styleSheet>');
+
+    sheets.forEach((s, i) =>
+      add(`xl/worksheets/sheet${i+1}.xml`, this._sheetXml(s.rows || [], s.widths)));
+
+    return await this._zip(files);
+  },
+
+  /** ブラウザに deflate があれば縮める（無ければそのまま） */
+  async _deflate(u8){
+    if (typeof CompressionStream !== 'function') return null;
+    try {
+      const cs = new CompressionStream('deflate-raw');
+      const buf = await new Response(
+        new Blob([u8]).stream().pipeThrough(cs)).arrayBuffer();
+      return new Uint8Array(buf);
+    } catch (e){ return null; }
+  },
+
+  /** ZIPを組み立てる（縮められるものは縮める） */
+  async _zip(files){
+    for (const f of files){
+      const z = await this._deflate(f.data);
+      // 縮んだときだけ使う（小さいXMLは逆に増えることがある）
+      if (z && z.length < f.data.length){ f.z = z; f.method = 8; }
+    }
+    return this._zipSync(files);
+  },
+
+  /** 圧縮なしのZIPを組み立てる */
+  _zipSync(files){
+    const chunks = [], central = [];
+    let offset = 0;
+    const u16 = n => [n & 0xFF, (n >>> 8) & 0xFF];
+    const u32 = n => [n & 0xFF, (n >>> 8) & 0xFF, (n >>> 16) & 0xFF, (n >>> 24) & 0xFF];
+    const enc = new TextEncoder();
+
+    files.forEach(f => {
+      const name = enc.encode(f.path);
+      const crc = this.crc32(f.data);          // CRCは「もとの中身」で計算する
+      const body = f.z || f.data;
+      const method = f.method || 0;
+      const local = [].concat(
+        u32(0x04034b50), u16(20), u16(0), u16(method), u16(0), u16(0),
+        u32(crc), u32(body.length), u32(f.data.length),
+        u16(name.length), u16(0));
+      chunks.push(new Uint8Array(local), name, body);
+      central.push({ name, crc, csize: body.length, size: f.data.length,
+                     method, offset });
+      offset += local.length + name.length + body.length;
+    });
+
+    const dirStart = offset;
+    let dirSize = 0;
+    central.forEach(c => {
+      const head = [].concat(
+        u32(0x02014b50), u16(20), u16(20), u16(0), u16(c.method), u16(0), u16(0),
+        u32(c.crc), u32(c.csize), u32(c.size),
+        u16(c.name.length), u16(0), u16(0), u16(0), u16(0), u32(0), u32(c.offset));
+      chunks.push(new Uint8Array(head), c.name);
+      dirSize += head.length + c.name.length;
+    });
+
+    chunks.push(new Uint8Array([].concat(
+      u32(0x06054b50), u16(0), u16(0),
+      u16(central.length), u16(central.length),
+      u32(dirSize), u32(dirStart), u16(0))));
+
+    return new Blob(chunks, {
+      type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+  },
+
+  /** 作ってそのまま保存させる */
+  async save(sheets, filename){
+    const blob = await this.build(sheets);
+    const a = el('a', { href: URL.createObjectURL(blob), download: filename });
+    document.body.appendChild(a); a.click();
+    setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+  }
+};
+
+/* ------------------------------------------------------------
    6. 画面の骨格とルーティング
    ------------------------------------------------------------ */
 const App = {
@@ -3237,6 +3523,8 @@ const App = {
     if (!this.ready){ v.appendChild(viewLoading()); return; }
 
     // バックエンドが古いときは、どの画面でもいちばん上に出す
+    const load = loadingNote();
+    if (load) v.appendChild(load);
     const up = appUpdateNote();
     if (up) v.appendChild(up);
     const warn = backendUpdateNote();
@@ -3410,6 +3698,39 @@ const TABLE_LABEL = {
  * ふつうは自動で新しくなるので、これが出るのは
  * 「version.txt だけ上げて index.html を上げ忘れた」ときだけです。
  */
+/**
+ * 前回の内容を出しているあいだの断り書き。
+ * 何も言わずに古い数字を見せるのは危ないので、必ず出します。
+ */
+function loadingNote(){
+  if (!Store.fromCache) return null;
+  if (Store.offlineNote){
+    return el('div', { class: 'note warn' },
+      el('b', {}, '最新にできませんでした。'), ' ',
+      '前回この端末で読んだ内容を出しています（',
+      fmtWhen(Store.cachedAt), 'の時点）。',
+      el('div', { style: 'margin-top:4px;color:var(--muted)' }, Store.offlineNote));
+  }
+  return el('div', { class: 'note', style: 'display:flex;align-items:center;gap:9px' },
+    el('span', { class: 'spinner sm' }),
+    el('span', {}, '最新にしています… いま出ているのは ', fmtWhen(Store.cachedAt), ' の内容です'));
+}
+
+/** 「3分前」「きのう 18:20」のような言い方に */
+function fmtWhen(iso){
+  const d = iso ? new Date(iso) : null;
+  if (!d || isNaN(d)) return '前回';
+  const min = Math.round((Date.now() - d.getTime()) / 60000);
+  if (min < 1) return 'たった今';
+  if (min < 60) return min + '分前';
+  const hh = String(d.getHours()).padStart(2, '0') + ':' +
+             String(d.getMinutes()).padStart(2, '0');
+  const dd = ymd(d), t = today();
+  if (dd === t) return hh;
+  if (dd === addDays(t, -1)) return 'きのう ' + hh;
+  return fmtDate(dd) + ' ' + hh;
+}
+
 function appUpdateNote(){
   if (!Updater.stuck || !Updater.latest) return null;
   const c = el('div', { class: 'note warn' });
@@ -3874,12 +4195,21 @@ function tabMilk(v, cow, a){
     height: 250,
     x: { domain: [0, maxDay], label: '日齢', fmt: v => r0(v) + '日', tip: v => r0(v) + '日齢' },
     y: { zero: true, fmt: v => r1(v) },
-    bars: [{ name: '哺乳量', color: cssVar('--s1'), opacity: .9,
-             // 便が乱れた日は、その日の棒そのものの色を変える。
-             // 「7Lに下げた日は軟便だった」が、棒を見ただけで分かるようにするため。
-             points: a.daily.map(d => ({ x: d.day, y: d.milkL, color: fecesColor(d.feces) })),
-             fmt: v => r1(v) + ' L' }],
     series: [
+      /* 哺乳量は折れ線。棒だと日が詰まったときに1本の塊に見えてしまい、
+         増えているのか減っているのかが読めませんでした。
+         線なら形がそのまま推移になります。
+         点は「その日の便の状態」の色。乱れた日だけ大きく色を付けるので、
+         「7Lに下げた日は軟便だった」が線の上にそのまま残ります。 */
+      { name: '哺乳量', color: cssVar('--s1'), width: 2.6, area: true,
+        dots: a.daily.length <= 60,
+        points: a.daily.map(d => {
+          const c = fecesColor(d.feces);
+          // ふだんの日は小さく（線を途切れさせないため）、
+          // 便が乱れた日だけ大きく色を付けて目立たせる
+          return { x: d.day, y: d.milkL, color: c, r: c ? 5.5 : 2.6 };
+        }),
+        fmt: v => r1(v) + ' L' },
       { name: a.programMeta.name, color: cssVar('--ink-2'), dashed: true, width: 2, noEndLabel: true,
         points: prog.map(p => ({ x: p.day, y: p.l })), fmt: v => r1(v) + ' L/日' }
     ].concat(others.map(o => ({
@@ -3887,7 +4217,7 @@ function tabMilk(v, cow, a){
       opacity: .4, noEndLabel: true,
       points: o.pts.map(p => ({ x: p.day, y: p.l })), fmt: v => r1(v) + ' L/日'
     }))).concat([
-      { name: 'スターター', color: cssVar('--s2'), dots: a.daily.length < 40,
+      { name: 'スターター', color: cssVar('--s2'), width: 1.8, dots: false,
         points: a.daily.map(d => ({ x: d.day, y: d.starter })), fmt: v => r2(v) + ' kg' }
     ]),
     markers: [
@@ -3897,7 +4227,7 @@ function tabMilk(v, cow, a){
         ? { x: f.weanDay, label: '離乳予測', color: cssVar('--s2') } : null,
       a.ageDays != null ? { x: a.ageDays, label: '今日', color: cssVar('--line'), solid: true } : null
     ].filter(Boolean),
-    caption: '棒＝1日の哺乳量（L）、破線＝プログラムの基準線、オレンジ＝スターター摂取（kg）。'
+    caption: '青い線＝1日の哺乳量（L）、破線＝プログラムの基準線、オレンジ＝スターター摂取（kg）。'
   }));
 
   // 便の色の見方。実際に出た状態だけを出す（出ていない色は説明しない）
@@ -3909,7 +4239,7 @@ function tabMilk(v, cow, a){
     seenFeces.forEach(x => lg.appendChild(fecesChip(x.label, cssVar(x.color))));
     c1.appendChild(lg);
     c1.appendChild(el('div', { class: 't-micro', style: 'color:var(--muted);margin-top:5px' },
-      '棒の色＝その日の便の状態。量を下げた日に色が付いていれば、下げた理由がそのまま残ります。'));
+      '点の色＝その日の便の状態。量を下げた日に色が付いていれば、下げた理由がそのまま残ります。'));
   }
   v.appendChild(c1);
 
@@ -6753,13 +7083,25 @@ function viewSettings(){
   c7.appendChild(el('h2', {}, 'データ'));
   c7.appendChild(el('div', { class: 'btnrow' },
     el('button', { class: 'btn sm primary', onclick: () => App.go('import') }, '📥 取り込み（Excel/CSV）'),
-    el('button', { class: 'btn sm', onclick: () => exportAll() }, '📤 書き出し（CSV）'),
+    el('button', { class: 'btn sm primary', onclick: () => openExportSheet() }, '📗 Excelで書き出す'),
+    el('button', { class: 'btn sm ghost', onclick: () => exportAll() }, '📤 CSV（表ごと）'),
     el('button', { class: 'btn sm', onclick: async () => {
       try { await Store.init(); toast('最新にしました'); App.render(); }
       catch(e){ toast(e.message, true); } } }, '🔄 再読み込み')));
-  const cnt = Store.counts || {};
-  c7.appendChild(el('div', { class: 'hint', style: 'margin-top:10px' },
-    `牛 ${cnt.cows ?? Store.cows.length}件 ／ 体重 ${cnt.weights ?? '—'}件 ／ 哺乳 ${cnt.milk_feed ?? '—'}件 ／ スターター ${cnt.starter ?? '—'}件 ／ 繁殖 ${cnt.repro ?? '—'}件`));
+  // 件数を数えるにはゲノム3,000行などを全部読むので、起動では取りません。
+  // この画面を開いたときにだけ、裏で数えに行きます。
+  const cntBox = el('div', { class: 'hint', style: 'margin-top:10px' },
+    '牛 ' + Store.cows.length + '件　（ほかの件数を数えています…）');
+  c7.appendChild(cntBox);
+  Store.counts().then(cnt => {
+    if (!cntBox.isConnected) return;
+    cntBox.textContent =
+      `牛 ${cnt.cows ?? Store.cows.length}件 ／ 体重 ${cnt.weights ?? '—'}件 ／ ` +
+      `哺乳 ${cnt.milk_feed ?? '—'}件 ／ スターター ${cnt.starter ?? '—'}件 ／ ` +
+      `繁殖 ${cnt.repro ?? '—'}件 ／ ゲノム ${cnt.genomics ?? '—'}件`;
+  }).catch(() => {
+    if (cntBox.isConnected) cntBox.textContent = '牛 ' + Store.cows.length + '件';
+  });
   wrap.appendChild(c7);
 
   /* --- 保存バー --- */
@@ -7478,6 +7820,252 @@ function parseJPDate(s){
   m = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})$/);
   if (m){ const y = +m[3] < 100 ? 2000 + (+m[3]) : +m[3]; return new Date(y, +m[1]-1, +m[2]); }
   return null;
+}
+
+/* ------------------------------------------------------------
+   Excel で書き出す
+   ------------------------------------------------------------
+   これまではCSVを表ごとに7個ダウンロードしていて、
+   見出しも英語のままでした（cow_no, volume_l …）。
+   ここでは、日本語の見出しを付けたExcelを1ファイルで作ります。
+
+   哺乳は「1日1行」も選べます。
+   朝・夕・合計・粉・便・飲み残しが横に並ぶので、
+   そのまま印刷したり、Excelでグラフにしたりできます。
+   ------------------------------------------------------------ */
+
+const EXPORT_KINDS = [
+  { key: 'milk_day',  label: '哺乳（1日1行）', hint: '朝・夕・合計が横に並ぶ、いちばん見やすい形' },
+  { key: 'milk_raw',  label: '哺乳（記録そのまま）', hint: '1回の給与＝1行' },
+  { key: 'weights',   label: '体重・胸囲' },
+  { key: 'starter',   label: 'スターター' },
+  { key: 'cows',      label: '個体（在籍・出荷ぜんぶ）' },
+  { key: 'repro',     label: '繁殖' },
+  { key: 'events',    label: '記録（移動・治療・申し送りなど）' },
+  { key: 'colostrum', label: '初乳' },
+  { key: 'genomics',  label: 'ゲノム' },
+  { key: 'milk_test', label: '乳検' }
+];
+
+/** 表ごとの、日本語の見出しと取り出し方 */
+const EXPORT_COLS = {
+  weights: [['date','測定日',12],['tag4','4桁',8],['cow_no','個体識別番号',15],
+            ['name','名号',16],['day','日齢',7],['chest_cm','胸囲cm',9],
+            ['weight_actual','実測kg',9],['weight_est','推定kg',9],
+            ['source','方法',9],['note','メモ',20]],
+  starter: [['date','日付',12],['tag4','4桁',8],['day','日齢',7],
+            ['intake_kg','摂取kg',9],['note','メモ',20]],
+  repro:   [['date','日付',12],['tag4','4桁',8],['cow_no','個体識別番号',15],
+            ['type','種別',9],['sire_code','精液',12],['result','結果',9],['note','メモ',20]],
+  events:  [['date','日付',12],['tag4','4桁',8],['type','種別',11],
+            ['detail','内容',26],['note','メモ',20],['updated_by','記録者',10]],
+  colostrum:[['date','日付',12],['tag4','4桁',8],['kind','区分',9],
+            ['feeding_no','回次',7],['hours_after_birth','出生後h',9],
+            ['volume_l','量L',8],['brix_pct','Brix%',8],['source','由来',11],
+            ['method','方法',11],['serum_tp','血清TP',8],['operator','記録者',10],
+            ['note','メモ',20]],
+  genomics:[['tag4','4桁',8],['cow_no','個体識別番号',15],['subject','対象',9],
+            ['trait','形質',12],['value','値',10],['date','検査日',12]],
+  milk_test:[['date','検定日',12],['tag4','4桁',8],['milk_kg','乳量kg',9],
+            ['fat_pct','乳脂%',8],['prot_pct','蛋白%',8],['scs','SCS',8],
+            ['scc','体細胞',10],['dim','分娩後日数',10]],
+  cows:    [['tag4','4桁',8],['cow_no','個体識別番号',15],['name','名号',18],
+            ['neck_no','ネック',9],['birth_date','生年月日',12],['ageDays','日齢',7],
+            ['sex','性別',7],['breed','品種',12],['dam_mgmt_no','母の4桁',9],
+            ['sire_name','父',14],['ped1','1代祖',12],['ped2','2代祖',12],['ped3','3代祖',12],
+            ['birth_weight','出生体重',9],['pen','部屋',11],['status','状態',9],
+            ['status_date','その日',12],['depot','預託先',12],['sale_to','出荷先',14],
+            ['sale_price','販売価格',12],['note','メモ',20]]
+};
+
+function openExportSheet(){
+  const picked = new Set(['milk_day', 'weights', 'cows']);
+  let from = addDays(today(), -90), to = today();
+
+  sheet('Excelで書き出す', (b, close) => {
+    if (!Store.isRemote){
+      b.appendChild(el('div', { class: 'note warn' },
+        'お試しモードでは、この端末に入れた分だけが書き出されます。'));
+    }
+
+    b.appendChild(el('div', { class: 't-micro',
+      style: 'color:var(--muted);font-weight:700;margin-bottom:5px' }, '何を書き出しますか'));
+    const list = el('div', { style: 'margin-bottom:14px' });
+    EXPORT_KINDS.forEach(k => {
+      const row = el('label', {
+        style: 'display:flex;align-items:flex-start;gap:10px;padding:7px 0;cursor:pointer;' +
+               'min-height:var(--tap-sm)'
+      });
+      const cb = el('input', { type: 'checkbox', style: 'width:22px;height:22px;flex:none;margin-top:2px' });
+      cb.checked = picked.has(k.key);
+      cb.onchange = () => { cb.checked ? picked.add(k.key) : picked.delete(k.key); };
+      row.appendChild(cb);
+      row.appendChild(el('div', { style: 'flex:1;min-width:0' },
+        el('div', { style: 'font-size:var(--t2);font-weight:650' }, k.label),
+        k.hint ? el('div', { class: 't-micro', style: 'color:var(--muted)' }, k.hint) : null));
+      list.appendChild(row);
+    });
+    b.appendChild(list);
+
+    const fFrom = inp({ type: 'date', value: from });
+    const fTo = inp({ type: 'date', value: to });
+    b.appendChild(el('div', { class: 'grid2' },
+      field('いつから', fFrom), field('いつまで', fTo)));
+    b.appendChild(el('div', { class: 'hint', style: 'margin:-8px 0 12px' },
+      '日付のある記録だけが絞られます。個体とゲノムは全部入ります。'));
+    b.appendChild(el('div', { class: 'chips sm', style: 'margin-bottom:14px' },
+      [['今月', () => { fFrom.value = ymd(new Date()).slice(0,8) + '01'; fTo.value = today(); }],
+       ['3か月', () => { fFrom.value = addDays(today(), -90); fTo.value = today(); }],
+       ['1年', () => { fFrom.value = addDays(today(), -365); fTo.value = today(); }],
+       ['ぜんぶ', () => { fFrom.value = '2000-01-01'; fTo.value = today(); }]
+      ].map(([t, fn]) => el('button', { class: 'chip', onclick: fn }, t))));
+
+    const out = el('div');
+    b.appendChild(out);
+
+    const btn = el('button', { class: 'btn primary', style: 'width:100%' }, '📗　Excelを作る');
+    btn.onclick = () => submitting(btn, async () => {
+      if (!picked.size) throw new Error('書き出すものを1つ以上選んでください');
+      from = ymd(fFrom.value) || '2000-01-01';
+      to = ymd(fTo.value) || today();
+      out.innerHTML = '';
+      const say = t => { out.innerHTML = ''; out.appendChild(el('div', { class: 'hint' }, t)); };
+      const sheets = await buildExportSheets(Array.from(picked), from, to, say);
+      if (!sheets.length) throw new Error('その期間には記録がありませんでした');
+      await XlsxOut.save(sheets, '白川牧場_' + today() + '.xlsx');
+      close();
+      toast(sheets.length + 'シートのExcelを作りました');
+    });
+    b.appendChild(btn);
+    b.appendChild(el('div', { class: 'hint', style: 'margin-top:8px' },
+      'iPhone では「ダウンロード」に入ります。ファイルアプリから開けます。'));
+  }, { focus: false });
+}
+
+/** 選ばれたぶんを取ってきて、シートの形にする */
+async function buildExportSheets(keys, from, to, say){
+  const cowBy = {};
+  Store.cows.forEach(c => { cowBy[String(c.cow_no)] = c; });
+  const tag = no => (cowBy[String(no)] || {}).tag4 || String(no);
+  const nameOf = no => (cowBy[String(no)] || {}).name || '';
+  const dayOf = (no, d) => {
+    const c = cowBy[String(no)];
+    return c ? ageDays(c.birth_date, d) : null;
+  };
+  const inRange = r => {
+    const d = ymd(r.date);
+    return !d || (d >= from && d <= to);
+  };
+
+  // 必要な表だけ取りに行く
+  const need = new Set();
+  keys.forEach(k => {
+    if (k === 'milk_day' || k === 'milk_raw') need.add('milk_feed');
+    else if (k !== 'cows') need.add(k);
+  });
+  const data = {};
+  for (const t of need){
+    say('「' + t + '」を読んでいます…');
+    const d = await Store.call({ action: 'export', table: t, from, to });
+    data[t] = (d.rows || []).filter(inRange);   // 古いGASが期間を無視しても効くように
+  }
+  say('Excelを組み立てています…');
+
+  const sheets = [];
+  const rowsOf = (table, cols, extra) => {
+    const src = data[table] || [];
+    if (!src.length) return null;
+    const head = cols.map(c => c[1]);
+    const body = src
+      .sort((a, b) => String(a.date) < String(b.date) ? -1 : 1)
+      .map(r => cols.map(([k]) => {
+        if (k === 'tag4') return tag(r.cow_no);
+        if (k === 'name') return nameOf(r.cow_no);
+        if (k === 'day') { const d = dayOf(r.cow_no, r.date); return d == null ? '' : d; }
+        const v = extra ? extra(k, r) : r[k];
+        const n = num(v);
+        return (n != null && String(v).trim() !== '' && !/^0\d/.test(String(v))) ? n : (v ?? '');
+      }));
+    return [head].concat(body);
+  };
+
+  keys.forEach(k => {
+    if (k === 'milk_day'){
+      const rows = milkByDayRows(data.milk_feed || [], cowBy);
+      if (rows) sheets.push({ name: '哺乳（1日1行）', rows,
+        widths: [12,8,16,7,8,8,9,9,10,10,20] });
+      return;
+    }
+    if (k === 'milk_raw'){
+      const cols = [['date','日付',12],['tag4','4桁',8],['day','日齢',7],
+                    ['feeding_no','回次',7],['milk_type','乳種',10],['volume_l','量L',8],
+                    ['powder_g_per_l','粉g/L',9],['refused','飲み残し',9],
+                    ['feces','便',10],['note','メモ',20]];
+      const rows = rowsOf('milk_feed', cols);
+      if (rows) sheets.push({ name: '哺乳（記録）', rows, widths: cols.map(c => c[2]) });
+      return;
+    }
+    if (k === 'cows'){
+      const cols = EXPORT_COLS.cows;
+      const body = Store.cows.slice()
+        .sort((a, b) => String(a.birth_date) < String(b.birth_date) ? 1 : -1)
+        .map(c => cols.map(([key]) => {
+          if (key === 'ageDays'){ const d = ageDays(c.birth_date); return d == null ? '' : d; }
+          const v = c[key];
+          const n = num(v);
+          return (key === 'sale_price' || key === 'birth_weight') && n != null ? n
+               : (v ?? '');
+        }));
+      sheets.push({ name: '個体', rows: [cols.map(c => c[1])].concat(body),
+                    widths: cols.map(c => c[2]) });
+      return;
+    }
+    const cols = EXPORT_COLS[k];
+    if (!cols) return;
+    const rows = rowsOf(k, cols);
+    if (rows) sheets.push({ name: EXPORT_KINDS.find(x => x.key === k).label,
+                            rows, widths: cols.map(c => c[2]) });
+  });
+  return sheets;
+}
+
+/** 哺乳を「1日1行」にまとめる */
+function milkByDayRows(src, cowBy){
+  if (!src.length) return null;
+  const byKey = new Map();
+  src.forEach(m => {
+    const d = ymd(m.date);
+    if (!d) return;
+    const key = d + '|' + String(m.cow_no);
+    if (!byKey.has(key))
+      byKey.set(key, { date: d, no: String(m.cow_no), am: null, pm: null,
+                       total: 0, powder: 0, refused: '', feces: '', note: [] });
+    const t = byKey.get(key);
+    const L = num(m.volume_l) || 0;
+    const slot = String(m.feeding_no || '');
+    if (slot === '1' || /朝|am/i.test(slot)) t.am = (t.am || 0) + L;
+    else if (slot === '2' || /夕|pm/i.test(slot)) t.pm = (t.pm || 0) + L;
+    t.total += L;
+    t.powder += L * (num(m.powder_g_per_l) || 0);
+    if (m.refused && String(m.refused).trim()) t.refused = String(m.refused);
+    if (m.feces && m.feces !== '正常') t.feces = String(m.feces);
+    else if (m.feces && !t.feces) t.feces = '正常';
+    if (m.note && String(m.note).trim()) t.note.push(String(m.note));
+  });
+
+  const head = ['日付','4桁','名号','日齢','朝L','夕L','合計L','粉g','飲み残し','便','メモ'];
+  const body = Array.from(byKey.values())
+    .sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : (a.no < b.no ? -1 : 1)))
+    .map(t => {
+      const c = cowBy[t.no] || {};
+      const day = ageDays(c.birth_date, t.date);
+      return [t.date, c.tag4 || t.no, c.name || '', day == null ? '' : day,
+              t.am == null ? '' : Math.round(t.am * 10) / 10,
+              t.pm == null ? '' : Math.round(t.pm * 10) / 10,
+              Math.round(t.total * 10) / 10, Math.round(t.powder),
+              t.refused, t.feces, Array.from(new Set(t.note)).join(' / ')];
+    });
+  return [head].concat(body);
 }
 
 /* ------------------------------------------------------------
@@ -9966,6 +10554,15 @@ const Updater = {
   // 画面より先に、新しい版が出ていないかを確かめる。
   // 新しければここで読み直しが走るので、この先は動きません。
   await Updater.check();
+
+  // 前回この端末で読んだ内容があれば、待たずにそれを出す。
+  // スプレッドシートとの往復には数秒かかるので、その間を白い画面にしない。
+  if (Store.initFromCache()){
+    Analysis.reset(); MilkBoard.reset();
+    App.ready = true;
+    App.render();
+  }
+
   try {
     await Store.init();
     Analysis.reset();
@@ -9977,6 +10574,13 @@ const Updater = {
     setTimeout(warmLikelyCows, 400);
   } catch (e){
     App.ready = true;
+    if (Store.fromCache){
+      // 前回の内容は出せている。圏外でも見るだけなら使えるので、
+      // 画面はそのままにして、上に断りだけ出す。
+      Store.offlineNote = e.message;
+      App.render();
+      return;
+    }
     App.view = 'settings';
     App.render();
     const main = $('#main .view');
