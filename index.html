@@ -221,6 +221,23 @@ textarea.inp{min-height:84px;resize:vertical;line-height:1.55}
 .tile .d{font-size:var(--t0);color:var(--muted);margin-top:3px;line-height:1.4}
 .tile .d.good{color:var(--good-ink)} .tile .d.bad{color:var(--crit)}
 
+/* 4桁の隣へ移る（← →）。カルテの見出しの下に置く細い帯 */
+.cownav{display:grid;grid-template-columns:1fr auto 1fr;gap:6px;align-items:stretch;
+  margin-top:11px}
+.cownav-btn{display:flex;align-items:center;gap:7px;justify-content:center;
+  min-height:var(--tap-sm);padding:5px 10px;border-radius:11px;
+  border:1px solid var(--ring);background:var(--surface-2);cursor:pointer;
+  font-family:inherit;color:var(--ink);width:100%}
+.cownav-btn:active{background:var(--surface-3);transform:translateY(1px)}
+.cownav-arw{font-size:calc(20px * var(--fs));line-height:1;color:var(--s1);font-weight:700}
+.cownav-txt{display:flex;flex-direction:column;align-items:center;line-height:1.15}
+.cownav-no{font-size:var(--t3);font-weight:800;font-variant-numeric:tabular-nums}
+.cownav-sub{font-size:var(--tmicro);color:var(--muted)}
+.cownav-mid{align-self:center;font-size:var(--tmicro);color:var(--muted);
+  padding:0 4px;white-space:nowrap}
+.cownav-empty{display:flex;align-items:center;justify-content:center;
+  font-size:var(--tmicro);color:var(--grid);min-height:var(--tap-sm);text-align:center}
+
 /* バッジ */
 .badge{
   display:inline-flex;align-items:center;gap:4px;font-size:var(--t0);font-weight:700;
@@ -861,14 +878,14 @@ const EVENT_TYPES = ['増乳開始','ピーク到達','減乳開始','離乳','�
  *               表や列が増えたときだけ上げる。上げたら Code.gs のデプロイも必要。
  * BUILD_ID     … この index.html を作った日時。作るたびに毎回変わる。
  *               「新しい画面が出ていないか」を見るためだけに使う。
- *               build.sh が 2026-09-06-0401 を実際の日時に置き換えます。
+ *               build.sh が 2026-09-06-0436 を実際の日時に置き換えます。
  */
 /* カルテを開いた瞬間に要る表と、タブを開いたときでいい表 */
 const COW_CORE_TABLES = ['weights', 'milk_feed', 'starter', 'repro', 'events', 'colostrum'];
 const COW_LAZY_TABLES = ['genomics', 'milk_test'];
 
 const APP_VERSION = '2026-09-06a';
-const BUILD_ID = '2026-09-06-0401';
+const BUILD_ID = '2026-09-06-0436';
 const REQUIRED_TABLES = ['cows', 'weights', 'milk_feed', 'starter', 'repro', 'events',
                          'genomics', 'milk_test', 'colostrum', 'pens', 'daily_check',
                          'settings'];
@@ -3846,6 +3863,7 @@ function quickHeader(cow){
       el('div', { style: 'color:var(--muted)' },
         [cow.breed, d != null ? d + '日齢' : null,
          w ? 'およそ ' + r0(w.kg) + ' kg' : null].filter(Boolean).join(' · ')))));
+  c.appendChild(cowNavRow(cow));
   c.appendChild(el('div', { class: 'hint', style: 'margin-top:10px' },
     el('span', { class: 'spinner sm' }), ' 記録を読み込んでいます…'));
   return c;
@@ -3869,6 +3887,10 @@ function cowHeader(cow, a){
          cow.sex, cow.pen ? cow.pen : null].filter(Boolean).join(' · '))),
     el('button', { class: 'iconbtn', title: '基本情報を編集',
       onclick: () => openBirthForm(cow) }, '✎')));
+
+  // 4桁の隣へ移る（← →）。同じハッチを順に見ていくときに、
+  // いちいち検索に戻らなくて済みます。
+  c.appendChild(cowNavRow(cow));
 
   // 2行目：品種・ネック・ステージ。カード幅いっぱいを使うので横に並びます
   const tags = el('div', { class: 'chips', style: 'margin:11px 0 13px' },
@@ -4147,6 +4169,81 @@ function milkNote(d, a){
   if (Math.abs(diff) < 0.15) return '目安どおり';
   return (diff > 0 ? '＋' : '−') + r1(Math.abs(diff)) + ' L';
 }
+
+/* ------------------------------------------------------------
+   4桁の隣へ移る（← →）
+   ------------------------------------------------------------
+   同じハッチの子を続けて見るとき、いちいち検索に戻るのは手間です。
+   4桁の順に並べて、ひとつ前・ひとつ後ろへ動けるようにしました。
+
+   ・並びは4桁の数の順（2070 → 2071 → 2072）
+   ・牧場を出た牛は飛ばします。ただし、いま出た牛を見ているときは
+     その並びの中で動けるようにします（出荷した子を続けて見たいことがあるため）
+   ・パソコンでは ← → キーでも動きます
+   ------------------------------------------------------------ */
+
+/** 4桁の順に並べた、移動できる牛の一覧 */
+function cowNavList(cow){
+  const away = isAwayStatus(cow && cow.status);
+  const list = Store.cows.filter(c => away ? true : isOnFarm(c));
+  const key = c => {
+    const n = num(String(c.tag4 || '').replace(/[^0-9]/g, ''));
+    return n == null ? Infinity : n;
+  };
+  return list.slice().sort((a, b) => (key(a) - key(b)) ||
+    (String(a.cow_no) < String(b.cow_no) ? -1 : 1));
+}
+
+/** いまの牛から dir（-1 / +1）だけ動いた先の牛 */
+function cowNeighbor(cow, dir){
+  const list = cowNavList(cow);
+  const i = list.findIndex(c => String(c.cow_no) === String(cow.cow_no));
+  if (i < 0) return null;
+  return list[i + dir] || null;
+}
+
+function cowNavRow(cow){
+  const prev = cowNeighbor(cow, -1), next = cowNeighbor(cow, +1);
+  const row = el('div', { class: 'cownav' });
+
+  const side = (c, dir) => {
+    if (!c) return el('div', { class: 'cownav-empty' },
+      dir < 0 ? 'いちばん小さい番号' : 'いちばん大きい番号');
+    const d = ageDays(c.birth_date);
+    return el('button', {
+      class: 'cownav-btn',
+      title: c.tag4 + ' へ',
+      onclick: () => App.openCow(c.cow_no)
+    },
+      dir < 0 ? el('span', { class: 'cownav-arw' }, '‹') : null,
+      el('span', { class: 'cownav-txt' },
+        el('span', { class: 'cownav-no' }, c.tag4 || '—'),
+        el('span', { class: 'cownav-sub' }, d == null ? '' : d + '日')),
+      dir > 0 ? el('span', { class: 'cownav-arw' }, '›') : null);
+  };
+
+  row.appendChild(side(prev, -1));
+  row.appendChild(el('div', { class: 'cownav-mid' }, '4桁の順'));
+  row.appendChild(side(next, +1));
+  return row;
+}
+
+/* パソコンで開いているとき用。← → キーでも隣へ動けます。
+   入力中は邪魔になるので、文字を打っているときは効かせません。 */
+document.addEventListener('keydown', e => {
+  if (App.view !== 'cow') return;
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  const t = e.target;
+  if (t && /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName)) return;
+  if (document.querySelector('.sheet')) return;      // シートが開いているときは触らない
+  if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+  const cow = Store.cows.find(c => String(c.cow_no) === String(App.cowNo));
+  if (!cow) return;
+  const to = cowNeighbor(cow, e.key === 'ArrowLeft' ? -1 : +1);
+  if (!to) return;
+  e.preventDefault();
+  App.openCow(to.cow_no);
+});
 
 /* --------------------------- 哺乳 --------------------------- */
 function tabMilk(v, cow, a){
