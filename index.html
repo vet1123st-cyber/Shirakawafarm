@@ -878,20 +878,20 @@ const EVENT_TYPES = ['増乳開始','ピーク到達','減乳開始','離乳','�
  *               表や列が増えたときだけ上げる。上げたら Code.gs のデプロイも必要。
  * BUILD_ID     … この index.html を作った日時。作るたびに毎回変わる。
  *               「新しい画面が出ていないか」を見るためだけに使う。
- *               build.sh が 2026-09-06-0436 を実際の日時に置き換えます。
+ *               build.sh が 2026-09-06-0917 を実際の日時に置き換えます。
  */
 /* カルテを開いた瞬間に要る表と、タブを開いたときでいい表 */
 const COW_CORE_TABLES = ['weights', 'milk_feed', 'starter', 'repro', 'events', 'colostrum'];
 const COW_LAZY_TABLES = ['genomics', 'milk_test'];
 
-const APP_VERSION = '2026-09-06a';
-const BUILD_ID = '2026-09-06-0436';
+const APP_VERSION = '2026-09-07a';
+const BUILD_ID = '2026-09-06-0917';
 const REQUIRED_TABLES = ['cows', 'weights', 'milk_feed', 'starter', 'repro', 'events',
                          'genomics', 'milk_test', 'colostrum', 'pens', 'daily_check',
-                         'settings'];
+                         'milk_plan', 'settings'];
 /** あとから増えた表。古いバックエンドは「どの表があるか」を答えられないので、
     そのときはこの並びだけを「足りないもの」として案内します。 */
-const NEW_TABLES = ['colostrum', 'pens', 'daily_check'];
+const NEW_TABLES = ['colostrum', 'pens', 'daily_check', 'milk_plan'];
 
 const Store = {
   cfg: LS.get('sw.cfg', { url: '', token: '', user: '' }),
@@ -906,6 +906,7 @@ const Store = {
   handover: [],              // 直近7日の申し送り
   todayChecks: [],           // 今日の作業チェック
   pens: [],                  // 牛舎の配置（見取り図の順に並べたもの）
+  milkPlans: [],             // 「この量で続ける」予定（哺乳ボードの初期値になる）
   serverVersion: null,       // バックエンド側の版
   missingTables: [],         // バックエンドに無い表（＝コードが古い）
   cache: {},          // cow_no -> 記録一式
@@ -967,7 +968,8 @@ const Store = {
       genomics: [], milk_test: [], colostrum: [], daily_check: [], pens: [], settings: {}
     });
     // あとから増えた表は、古い端末の保存分にも足しておく
-    ['colostrum', 'daily_check', 'pens'].forEach(t => { if (!this._db[t]) this._db[t] = []; });
+    ['colostrum', 'daily_check', 'pens', 'milk_plan']
+      .forEach(t => { if (!this._db[t]) this._db[t] = []; });
     return this._db;
   },
   saveLocal(){ LS.set('sw.db', this._db); },
@@ -996,6 +998,11 @@ const Store = {
                    .filter(e => e.type === '申し送り' && String(e.date) >= addDays(today(), -7))
                    .map(e => ({ cow_no: e.cow_no, date: e.date, detail: e.detail,
                                 note: e.note, updated_by: e.updated_by })),
+                 milkPlans: (db.milk_plan || [])
+                   .filter(p => !(String(p.to_date || '').slice(0, 10) < today()))
+                   .map(p => ({ id: p.id, cow_no: String(p.cow_no),
+                                from_date: p.from_date, to_date: p.to_date,
+                                am_l: p.am_l, pm_l: p.pm_l, note: p.note || '' })),
                  todayChecks: (db.daily_check || [])
                    .filter(r => String(r.date || '').slice(0, 10) === today())
                    .map(r => ({ date: r.date, slot: r.slot, item: r.item, done: r.done,
@@ -1186,6 +1193,7 @@ const Store = {
     this.handover = (d.handover || []).slice()
       .sort((a, b) => String(a.date) < String(b.date) ? 1 : -1);
     this.todayChecks = d.todayChecks || [];
+    this.milkPlans = d.milkPlans || [];
     this.penRows = d.pens || [];          // 生のまま（部屋を足し引きするときに使う）
     this.pens = normalizePens(this.penRows);
 
@@ -1365,6 +1373,13 @@ const Store = {
         this.cows[i] = normalizeCow(merged);
         break;
       }
+      case 'milk_plan': {
+        // 1頭につき1件。入れ直したら古いほうは消す
+        if (!no) return;
+        this.milkPlans = (this.milkPlans || []).filter(p => String(p.cow_no) !== no);
+        if (String(row.deleted) !== '1') this.milkPlans.push(Object.assign({}, row, { cow_no: no }));
+        break;
+      }
       case 'pens': {
         const i = (this.penRows || []).findIndex(p => String(p.id) === String(row.id));
         if (i >= 0) this.penRows[i] = Object.assign({}, this.penRows[i], row);
@@ -1508,6 +1523,43 @@ function normalizeCow(c){
  * 哺乳の量がホルスタインとは違うので、現場で一目で分かるよう色を変えます。
  */
 function isWagyu(cow){ return /和牛|黒毛/.test(String(cow && cow.breed || '')); }
+
+/* ------------------------------------------------------------
+   「この量でしばらく続ける」——毎日の入力を減らすための予定
+   ------------------------------------------------------------
+   毎日おなじ量を打ち直すのは手間なので、その子の量を覚えておいて、
+   哺乳ボードを開いたときに最初から入っている状態にします。
+
+   大事なのは「記録を先に書いてしまわない」ことです。
+   先の日付ぶんを書いてしまうと、下痢で減らした日や市場に出した日も
+   「飲んだ」ことになり、安全圏の計算がずれてしまいます。
+   ここは予定だけを持ち、実際に飲ませた記録は、その日に確定したぶんだけ残します。
+   ------------------------------------------------------------ */
+
+/** その牛の、その日に効いている予定。無ければ null */
+function milkPlanOf(cowNo, onDate){
+  const d = ymd(onDate || today());
+  const no = String(cowNo);
+  const list = (Store.milkPlans || []).filter(p => String(p.cow_no) === no);
+  if (!list.length) return null;
+  // 新しく入れたものを優先する
+  for (let i = list.length - 1; i >= 0; i--){
+    const p = list[i];
+    const from = ymd(p.from_date), to = ymd(p.to_date);
+    if (from && d < from) continue;
+    if (to && d > to) continue;
+    return p;
+  }
+  return null;
+}
+
+/** 予定の残り日数（今日を1日目として数える）。期限なしは null */
+function milkPlanDaysLeft(plan, onDate){
+  if (!plan) return null;
+  const to = ymd(plan.to_date);
+  if (!to) return null;
+  return daysBetween(ymd(onDate || today()), to) + 1;
+}
 
 /* ------------------------------------------------------------
    牧場にいるか、出ているか
@@ -8639,11 +8691,17 @@ function exportAnalysis(rows){
 /* ------------------------------------------------------------
    16. 哺乳ボード — 現場での毎日の入力
    ------------------------------------------------------------
-   使い方の想定：
-     1)「プログラムの量を入れる」でその日のおおまかな量を一括で埋める
-     2) 下痢や肺炎で下がった牛だけ、± ボタンで個別に直す
-     3) 気になった牛だけ 飲み残し・便の状態 を押す
-     4) まとめて保存
+   使い方の想定（毎日の入力をできるだけ減らす）：
+     1) 開くと、前日と同じ量がすでに入っている（＝見込み）
+        ・「この量で続ける」を入れてある牛は、その量が入ります
+        ・前日の記録が無い牛は、プログラムの目安が入ります
+        ・プログラムの目安が前日より上がる日は、その差だけ自動で上がります
+     2)「全部このままでOK」を1回押す
+     3) 違う牛だけ、その行を開いて ± で直す（直すと自動で確定になります）
+     4) 保存する
+
+   ※「見込み」のまま確認していない牛は保存しません。
+     牛舎を回らずに全部が記録として残ってしまうのを防ぐためです。
    ------------------------------------------------------------ */
 
 const MilkBoard = {
@@ -8704,6 +8762,10 @@ const MilkBoard = {
                               : '標準の平均（未測定）',
                prevAm: null, prevPm: null, prevDate: null,
                am: null, pm: null, refused: '', feces: '', note: '',
+               plan: milkPlanOf(c.cow_no, date),
+               from: '',            // plan | prev | prog（初期値をどこから持ってきたか）
+               progDiff: 0,         // プログラムの目安が前日から動いたぶん
+               confirmed: false,    // 「このままでOK」を押したか
                saved: false, open: false, changed: false };
     });
     this.date = date;
@@ -8717,12 +8779,16 @@ const MilkBoard = {
     if (this.loading) return;
     this.loading = true;
     try {
-      // 前日の分も一緒に読む。「前回よりどれだけ増やしたか」を出すため。
+      // 前日の分も一緒に読む。
+      //   ・前日と同じ量を、開いた時点で入れておくため
+      //   ・「前回よりどれだけ増やしたか」を安全圏の判定に使うため
+      // 2日分をまとめて1回で取ります（1往復ぶん、待ち時間が減ります）。
       const prevDate = addDays(this.date, -1);
-      const [d, dp] = await Promise.all([
-        Store.call({ action: 'export', table: 'milk_feed', date: this.date }),
-        Store.call({ action: 'export', table: 'milk_feed', date: prevDate })
-      ]);
+      const all = await Store.call({ action: 'export', table: 'milk_feed',
+                                     from: prevDate, to: this.date });
+      const onDay = ds => (all.rows || [])
+        .filter(m => String(m.date || '').slice(0, 10) === ds);
+      const d = { rows: onDay(this.date) }, dp = { rows: onDay(prevDate) };
       const byPrev = {};
       (dp.rows || []).forEach(m => {
         (byPrev[String(m.cow_no)] = byPrev[String(m.cow_no)] || []).push(m);
@@ -8770,14 +8836,72 @@ const MilkBoard = {
         r.note = src.note || '';
         r.saved = true;
       });
+      this.prefill();
     } finally { this.loading = false; }
   },
 
+  /* ------------------------------------------------------------
+     開いた時点で、量を入れておく
+     ------------------------------------------------------------
+     毎日おなじ数字を打ち直すのが手間なので、最初から入れておきます。
+     ただし「入っている＝確認した」ではありません。
+     確認していない牛は保存しない（confirmed を見る）ので、
+     牛舎を回らずに記録だけが残ることはありません。
+     ------------------------------------------------------------ */
+  prefill(){
+    this.rows.forEach(r => {
+      if (r.saved){ r.confirmed = true; return; }   // その日すでに保存してある牛
+      if (r.am != null || r.pm != null) return;     // 手で触ってある牛
+
+      // ① この量で続ける、と決めてある牛
+      const plan = r.plan = milkPlanOf(r.cow.cow_no, this.date);
+      if (plan && (num(plan.am_l) != null || num(plan.pm_l) != null)){
+        r.am = num(plan.am_l); r.pm = num(plan.pm_l); r.from = 'plan';
+        return;
+      }
+
+      // ② 前日と同じ。ただしプログラムの目安が動く日は、その差だけ動かす。
+      //    （増乳の日に手で足す手間をなくすため。下痢で下げてある子の
+      //      「下げてある分」はそのまま残ります）
+      if (r.prevAm != null || r.prevPm != null){
+        let diff = 0;
+        if (r.day != null && r.day > 1){
+          const y = Calc.programAt(r.progKey, r.day - 1, addDays(this.date, -1));
+          if (y && r.prog) diff = Math.round((r.prog.perFeed - y.perFeed) * 100) / 100;
+        }
+        const adj = v => v == null ? null : Math.max(0, Math.round((v + diff) * 100) / 100);
+        r.am = adj(r.prevAm); r.pm = adj(r.prevPm);
+        r.from = 'prev'; r.progDiff = diff;
+        return;
+      }
+
+      // ③ 前日の記録が無い牛（生まれたて・戻ってきた牛）はプログラムの目安
+      if (r.prog && r.prog.perFeed > 0){
+        r.am = r.pm = r.prog.perFeed; r.from = 'prog';
+      }
+    });
+  },
+
+  /** まだ「このままでOK」を押していない牛（量は入っている） */
+  pending(){
+    return this.rows.filter(r => !r.confirmed && !r.changed &&
+      ((num(r.am, 0) || 0) + (num(r.pm, 0) || 0)) > 0);
+  },
+
+  /** 量が入っている牛を全部「このままでOK」にする */
+  confirmAll(){
+    this.rows.forEach(r => {
+      if (((num(r.am, 0) || 0) + (num(r.pm, 0) || 0)) > 0) r.confirmed = true;
+    });
+  },
+
+  /** 全部をプログラムの目安にそろえ直す（⚙ の中。ふだんは使いません） */
   fillProgram(){
     this.rows.forEach(r => {
+      if (r.saved) return;
       if (r.prog && r.prog.perFeed > 0){
-        if (r.am == null) r.am = r.prog.perFeed;
-        if (r.pm == null) r.pm = r.prog.perFeed;
+        r.am = r.pm = r.prog.perFeed;
+        r.from = 'prog'; r.progDiff = 0; r.changed = true; r.confirmed = true;
       }
     });
   },
@@ -8838,13 +8962,30 @@ function viewMilkBoard(){
       '　± ' + (MilkBoard.step < 1 ? r1(MilkBoard.step) : MilkBoard.step) + 'L'),
     gear));
 
-  head.appendChild(el('button', { class: 'btn primary',
-    onclick: () => { MilkBoard.fillProgram(); App.render(); } },
-    '① プログラムの量を入れる'));
-  head.appendChild(el('div', { class: 't-micro',
-    style: 'margin-top:6px;color:var(--muted);line-height:1.5' },
-    '② そのあと、下がった牛だけ ± で直します（数値は1回あたりのL）。',
-    '　朝 ' + S['routine.am_milk'] + ' ／ 夕 ' + S['routine.pm_milk']));
+  /* いちばん押されるボタン。
+     開いた時点で前日と同じ量が入っているので、ふだんはこれ1回で終わります。 */
+  const pend = MilkBoard.pending();
+  const okCount = MilkBoard.rows.filter(r =>
+    (r.confirmed || r.changed) &&
+    ((num(r.am, 0) || 0) + (num(r.pm, 0) || 0)) > 0).length;
+
+  if (MilkBoard.loading){
+    head.appendChild(el('button', { class: 'btn', disabled: true },
+      el('span', { class: 'spinner sm' }), ' 前日の量を読んでいます…'));
+  } else if (pend.length){
+    head.appendChild(el('button', { class: 'btn primary',
+      onclick: () => { MilkBoard.confirmAll(); App.render(); } },
+      '✓ 全部このままでOK（' + pend.length + '頭）'));
+    head.appendChild(el('div', { class: 't-micro',
+      style: 'margin-top:6px;color:var(--muted);line-height:1.5' },
+      '前日と同じ量が入っています。違う牛だけ、その行を開いて ± で直してください。',
+      el('br'), '朝 ' + S['routine.am_milk'] + ' ／ 夕 ' + S['routine.pm_milk']));
+  } else {
+    head.appendChild(el('div', { class: 'note',
+      style: 'margin:0;background:color-mix(in srgb,var(--good) 10%,transparent)' },
+      okCount ? '✓ ' + okCount + '頭ぶん確認しました。下の「保存する」を押してください。'
+              : '哺乳の量が入っている牛がいません。'));
+  }
 
   if (MilkBoard.showOpts){
     /* 並び順（牛舎の配置を作ってあるときだけ出す） */
@@ -8863,6 +9004,19 @@ function viewMilkBoard(){
           ? 'ハッチを実際に歩く順に並びます。飛ばしや二度づけが減ります。'
           : '初乳→増乳→ピーク→減乳→離乳 の順に並びます。'));
     }
+
+    head.appendChild(el('hr', { class: 'sep', style: 'margin:12px 0 8px' }));
+    head.appendChild(el('div', { class: 't-micro',
+      style: 'color:var(--muted);font-weight:700;margin-bottom:5px' }, 'やり直し'));
+    head.appendChild(el('button', { class: 'btn sm ghost', style: 'width:100%',
+      onclick: () => confirmSheet('プログラムの目安にそろえる',
+        '入っている量を消して、全部プログラムの目安に入れ直します。' +
+        '下痢などで下げてあった牛も目安に戻ります。',
+        'そろえる', async () => { MilkBoard.fillProgram(); App.render(); },
+        { danger: false }) },
+      'プログラムの目安に全部そろえる'));
+    head.appendChild(el('div', { class: 'hint' },
+      'ふだんは要りません。前日の量がおかしくなったときだけ使ってください。'));
 
     head.appendChild(el('hr', { class: 'sep', style: 'margin:12px 0 8px' }));
     head.appendChild(el('div', { class: 't-micro',
@@ -8938,7 +9092,10 @@ function viewMilkBoard(){
 
     for (const r of MilkBoard.rows){
       const a = num(r.am), p2 = num(r.pm);
-      if (a == null && p2 == null) continue;   // 触っていない牛は何もしない
+      if (a == null && p2 == null) continue;   // 量が入っていない牛は何もしない
+      // 「見込み」のまま確認していない牛は書かない。
+      // 牛舎を回らずに全頭が記録として残ってしまうのを防ぐためです。
+      if (!r.confirmed && !r.changed) continue;
       if (r.saved && !r.changed) continue;     // 保存済みで直していない牛は送らない
       const type = r.day <= colo ? '初乳' : '代用乳';
       const mk = (no, v) => ({
@@ -8966,8 +9123,11 @@ function viewMilkBoard(){
     }
     if (!saved){
       const done = MilkBoard.rows.filter(r => r.saved).length;
-      throw new Error(done ? 'すべて保存済みです（直した牛はありません）'
-                           : '入力された量がありません');
+      const pend2 = MilkBoard.pending().length;
+      throw new Error(pend2
+        ? '上の「全部このままでOK」を押してください（未確認 ' + pend2 + '頭）'
+        : (done ? 'すべて保存済みです（直した牛はありません）'
+                : '入力された量がありません'));
     }
     Analysis.reset();
     toast(cows + '頭分を保存しました');
@@ -8980,6 +9140,152 @@ function viewMilkBoard(){
     (t.powder >= 1000 ? r1(t.powder/1000) + ' kg' : r0(t.powder) + ' g')));
   wrap.appendChild(bar);
   return wrap;
+}
+
+/* ------------------------------------------------------------
+   「この量で続ける」
+   ------------------------------------------------------------
+   毎日おなじ数字を打ち直す手間をなくすための予定です。
+   先の日付の記録を書いてしまうのではなく、予定として覚えておくだけなので、
+   ・下痢で減らした日   … その日直した量が記録に残る
+   ・市場や預託に出た日 … そもそも画面に出ないので、何も残らない
+   となり、あとから記録を直す手間も、安全圏の計算のずれも起きません。
+
+   奥さん・お母さんが哺乳に入るときの「この子はこの量で」という
+   申し送りにもなります。
+   ------------------------------------------------------------ */
+
+/** 「◯日先まで続ける」の候補 */
+function milkPlanSpans(r){
+  const out = [[3, '3日'], [5, '5日'], [7, '1週間'], [14, '2週間'], [30, '1か月']];
+  const marks = Calc.programMarks(r.progKey);
+  if (marks && marks.weanDay && r.day != null){
+    const left = marks.weanDay - r.day;
+    if (left > 0 && left <= 120) out.push([left, '離乳まで（' + left + '日）']);
+  }
+  return out;
+}
+
+function milkPlanBox(r){
+  const box = el('div', { style: 'margin:10px 0 4px' });
+  const total = (num(r.am, 0) || 0) + (num(r.pm, 0) || 0);
+
+  if ((Store.missingTables || []).indexOf('milk_plan') >= 0){
+    box.appendChild(el('div', { class: 't-micro', style: 'color:var(--muted);line-height:1.5' },
+      '「この量で続ける」を使うには、スプレッドシート側（Code.gs）の更新が必要です。'));
+    return box;
+  }
+
+  const plan = r.plan;
+  if (plan){
+    const left = milkPlanDaysLeft(plan, MilkBoard.date);
+    const same = num(plan.am_l) === num(r.am) && num(plan.pm_l) === num(r.pm);
+    box.appendChild(el('div', {
+      style: 'background:var(--surface-2);border-radius:var(--r-sm);padding:9px 11px' },
+      el('div', { style: 'font-size:var(--t1);line-height:1.6' },
+        el('b', {}, '続ける '), '朝 ' + r1(num(plan.am_l) ?? 0) + ' / 夕 ' +
+        r1(num(plan.pm_l) ?? 0) + ' L',
+        plan.to_date
+          ? el('span', { style: 'color:var(--muted)' },
+              '　' + fmtDate(plan.to_date) + 'まで' +
+              (left != null ? '（あと' + left + '日）' : ''))
+          : null),
+      same ? null : el('div', { class: 't-micro', style: 'color:var(--warn);margin-top:3px' },
+        '今日の量は、続ける量と違います。今日だけ変えるならこのままでOKです。'),
+      el('div', { class: 'btnrow', style: 'margin-top:8px' },
+        el('button', { class: 'btn sm ghost',
+          onclick: () => openMilkPlanSheet(r) }, '量や日数を変える'),
+        el('button', { class: 'btn sm ghost', style: 'color:var(--muted)',
+          onclick: () => confirmSheet('続けるのをやめる',
+            r.cow.tag4 + ' の「この量で続ける」をやめます。' +
+            'これまでの哺乳の記録は消えません。',
+            'やめる', async () => {
+              await Store.replace('milk_plan', { cow_no: r.cow.cow_no }, []);
+              Store.milkPlans = (Store.milkPlans || [])
+                .filter(x => String(x.cow_no) !== String(r.cow.cow_no));
+              r.plan = null;
+              toast('続けるのをやめました');
+              App.render();
+            }) }, 'やめる'))));
+    return box;
+  }
+
+  const b = el('button', {
+    class: 'btn sm ghost', style: 'width:100%',
+    onclick: () => openMilkPlanSheet(r)
+  }, '📌　この量でしばらく続ける');
+  if (!(total > 0)){
+    b.disabled = true;
+    box.appendChild(b);
+    box.appendChild(el('div', { class: 't-micro', style: 'color:var(--muted);margin-top:4px' },
+      '先に量を入れてください。'));
+    return box;
+  }
+  box.appendChild(b);
+  box.appendChild(el('div', { class: 't-micro', style: 'color:var(--muted);margin-top:4px;line-height:1.5' },
+    '毎日この量が最初から入るようになります。記録は、その日「OK」を押したぶんだけ残ります。'));
+  return box;
+}
+
+function openMilkPlanSheet(r){
+  let days = 7;
+  let am = num(r.am) ?? (r.prog ? r.prog.perFeed : 0);
+  let pm = num(r.pm) ?? (r.prog ? r.prog.perFeed : 0);
+  sheet(r.cow.tag4 + ' — この量で続ける', (b, close) => {
+    const until = el('div', { class: 't-micro', style: 'color:var(--muted);margin:-2px 0 10px' });
+    const showUntil = () => {
+      until.textContent = fmtDateFull(addDays(MilkBoard.date, days - 1)) + ' まで（' +
+        days + '日ぶん）';
+    };
+
+    const amt = el('div', { style: 'font-size:var(--t3);font-weight:700;margin-bottom:8px' });
+    const showAmt = () => {
+      amt.textContent = '朝 ' + r1(am) + ' L ／ 夕 ' + r1(pm) + ' L　（1日 ' + r1(am + pm) + ' L）';
+    };
+    showAmt();
+    b.appendChild(amt);
+    b.appendChild(el('div', { class: 't-micro', style: 'color:var(--muted);margin:-4px 0 12px' },
+      'いま入っている量です。変えたいときは、この画面を閉じて ± で直してから押してください。'));
+
+    b.appendChild(el('div', { class: 't-micro',
+      style: 'font-weight:700;color:var(--muted);margin-bottom:5px' }, 'いつまで続けるか'));
+    const chips = el('div', { class: 'chips sm', style: 'margin-bottom:6px' });
+    const draw = () => {
+      chips.innerHTML = '';
+      milkPlanSpans(r).forEach(([d, label]) => {
+        chips.appendChild(el('button', {
+          class: 'chip', 'aria-pressed': days === d,
+          onclick: () => { days = d; draw(); showUntil(); }
+        }, label));
+      });
+    };
+    draw(); showUntil();
+    b.appendChild(chips);
+    b.appendChild(until);
+
+    b.appendChild(el('div', { class: 'note', style: 'margin:10px 0' },
+      '記録を先に書いてしまうわけではありません。',
+      el('br'),
+      '毎日この量が最初から入るようになるだけなので、',
+      'その日に「OK」を押したぶんだけが記録に残ります。',
+      el('br'),
+      '下痢で減らした日は、その日だけ ± で直せば大丈夫です。'));
+
+    const ok = el('button', { class: 'btn primary', style: 'width:100%' }, 'この量で続ける');
+    ok.onclick = () => submitting(ok, async () => {
+      const row = { cow_no: r.cow.cow_no, from_date: MilkBoard.date,
+                    to_date: addDays(MilkBoard.date, days - 1),
+                    am_l: am, pm_l: pm, note: '' };
+      await Store.replace('milk_plan', { cow_no: r.cow.cow_no }, [row]);
+      r.plan = milkPlanOf(r.cow.cow_no, MilkBoard.date);
+      if (((num(r.am, 0) || 0) + (num(r.pm, 0) || 0)) > 0) r.confirmed = true;
+      toast(r.cow.tag4 + '　' + days + '日ぶん続けます');
+      close(); App.render();
+    });
+    b.appendChild(ok);
+    b.appendChild(el('button', { class: 'btn ghost', style: 'width:100%;margin-top:8px',
+      onclick: close }, 'やめる'));
+  }, { focus: false });
 }
 
 /** その行の「無理のない量か」を、朝と夕それぞれで見て、悪いほうを返す */
@@ -9008,6 +9314,11 @@ const SAFETY_TONE = {
 /* --- 1頭分の行 --- */
 function milkRow(r){
   const safe = rowSafety(r);
+  const plan = r.plan;
+  const left = milkPlanDaysLeft(plan, MilkBoard.date);
+  // 量は入っているが、まだ「このままでOK」を押していない状態
+  const guess = !r.saved && !r.confirmed && !r.changed &&
+                ((num(r.am, 0) || 0) + (num(r.pm, 0) || 0)) > 0;
   const flagged = (r.feces && r.feces !== '正常') || safe.level === 'high';
   // 和牛はホルスタインと哺乳量がまるで違うので、行ごと色で分かるようにする
   const wagyu = isWagyu(r.cow);
@@ -9052,6 +9363,14 @@ function milkRow(r){
       r.prog ? r1(r.prog.perFeed) + ' L/回・粉' + r0(r.prog.powderPerFeed) + 'g' : '',
       r.saved && !r.changed
         ? el('span', { class: 'badge good', style: 'margin-left:6px' }, '保存済み') : null,
+      plan ? el('span', { class: 'badge', style: 'margin-left:6px' },
+        '継続' + (left != null ? ' あと' + left + '日' : '')) : null,
+      guess ? el('div', { style: 'color:var(--muted)' },
+        r.from === 'plan' ? '見込み・継続の量'
+          : r.from === 'prog' ? '見込み・目安どおり'
+          : r.progDiff > 0 ? '見込み・前日＋' + r1(r.progDiff) + 'L'
+          : r.progDiff < 0 ? '見込み・前日−' + r1(-r.progDiff) + 'L'
+          : '見込み・前日と同じ') : null,
       r.refused ? el('span', { class: 'badge warn', style: 'margin-left:6px' }, '残' ) : null,
       r.feces && r.feces !== '正常'
         ? el('span', { class: 'badge crit', style: 'margin-left:6px' }, r.feces) : null,
@@ -9062,7 +9381,8 @@ function milkRow(r){
         '目安より −' + r1(target - total) + ' L') : null),
     el('div', { style: 'text-align:right;min-width:82px' },
       el('div', { style: 'font-size:var(--t4);font-weight:800;font-variant-numeric:tabular-nums' +
-                         (safe.level === 'high' ? ';color:var(--crit)' : '') },
+                         (safe.level === 'high' ? ';color:var(--crit)'
+                          : guess ? ';color:var(--muted)' : '') },
         total > 0 ? r1(total) + ' L'
                   : el('span', { style: 'color:var(--muted);font-weight:500;font-size:var(--t1)' }, '未入力')),
       el('div', { style: 'font-size:var(--t0);color:var(--muted)' },
@@ -9082,11 +9402,11 @@ function milkRow(r){
     const f = inp({ type: 'number', inputmode: 'decimal', step: '0.1',
       value: r[key] == null ? '' : r1(r[key]) });
     f.addEventListener('input', () => {
-      r[key] = f.value === '' ? null : num(f.value); r.changed = true; });
+      r[key] = f.value === '' ? null : num(f.value); r.changed = true; r.confirmed = true; });
     const bump = d => {
       const cur = num(r[key], 0) ?? 0;
       r[key] = Math.max(0, Math.round((cur + d) * 100) / 100);
-      r.changed = true; App.render();
+      r.changed = true; r.confirmed = true; App.render();
     };
     const prog = r.prog ? r1(r.prog.perFeed) : null;
     return el('div', { style: 'margin-bottom:12px' },
@@ -9096,7 +9416,8 @@ function milkRow(r){
         prog ? el('button', {
           class: 'btn sm ghost',
           style: 'margin-left:auto;min-height:40px;padding:4px 12px;font-size:var(--t1)',
-          onclick: () => { r[key] = num(prog); r.changed = true; App.render(); }
+          onclick: () => { r[key] = num(prog); r.changed = true; r.confirmed = true;
+                           App.render(); }
         }, '目安 ' + prog + 'L にする') : null),
       el('div', { class: 'stepper' },
         el('button', { onclick: () => bump(-MilkBoard.step), 'aria-label': label + 'を減らす' }, '−'),
@@ -9143,6 +9464,9 @@ function milkRow(r){
   fn.addEventListener('input', () => { r.note = fn.value; r.changed = true; });
   det.appendChild(field('メモ', fn));
 
+  /* この量で続ける（毎日の入力を減らすための予定） */
+  det.appendChild(milkPlanBox(r));
+
   /* 次の牛へ。ここが現場でいちばん押される場所なので、大きく前に出す。
      順番は、上の並び（歩く順）のまま。入れ終わったらそのまま歩いて次へ行けます。 */
   const idx = MilkBoard.rows.indexOf(r);
@@ -9150,6 +9474,8 @@ function milkRow(r){
   det.appendChild(el('button', {
     class: 'btn primary', style: 'width:100%;margin-top:4px',
     onclick: () => {
+      // 開いて見た＝確認した、とみなします
+      if (((num(r.am, 0) || 0) + (num(r.pm, 0) || 0)) > 0) r.confirmed = true;
       MilkBoard.rows.forEach(x => { x.open = false; });
       if (next){
         next.open = true;
