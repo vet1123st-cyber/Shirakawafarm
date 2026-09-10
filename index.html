@@ -886,14 +886,14 @@ const EVENT_TYPES = ['増乳開始','ピーク到達','減乳開始','離乳','�
  *               表や列が増えたときだけ上げる。上げたら Code.gs のデプロイも必要。
  * BUILD_ID     … この index.html を作った日時。作るたびに毎回変わる。
  *               「新しい画面が出ていないか」を見るためだけに使う。
- *               build.sh が 2026-09-10-0335 を実際の日時に置き換えます。
+ *               build.sh が 2026-09-10-0434 を実際の日時に置き換えます。
  */
 /* カルテを開いた瞬間に要る表と、タブを開いたときでいい表 */
 const COW_CORE_TABLES = ['weights', 'milk_feed', 'starter', 'repro', 'events', 'colostrum'];
 const COW_LAZY_TABLES = ['genomics', 'milk_test'];
 
-const APP_VERSION = '2026-09-07a';
-const BUILD_ID = '2026-09-10-0335';
+const APP_VERSION = '2026-09-10a';
+const BUILD_ID = '2026-09-10-0434';
 const REQUIRED_TABLES = ['cows', 'weights', 'milk_feed', 'starter', 'repro', 'events',
                          'genomics', 'milk_test', 'colostrum', 'pens', 'daily_check',
                          'milk_plan', 'settings'];
@@ -926,8 +926,32 @@ const Store = {
   saveCfg(c){ this.cfg = Object.assign({}, this.cfg, c); LS.set('sw.cfg', this.cfg); },
 
   /* --- 通信 --- */
+  /* 同じことをもう一度送っても、結果が変わらない操作。
+     電波が切れたときに、黙って1回だけやり直せます。
+     append（1行足す）と bulk（取り込み）は、送り直すと二重になるので入れません。 */
+  RETRYABLE: ['init', 'cow', 'cowsBulk', 'counts', 'benchmark', 'export',
+              'replace', 'replaceMany', 'update', 'updateMany', 'remove',
+              'saveCow', 'saveCowsMany', 'saveSettings', 'ping'],
+
   async call(payload){
     if (!this.isRemote) return this.local(payload);
+    /* 現場は電波が弱いことがあり、送信そのものが落ちることがあります。
+       「保存できませんでした」と出す前に、静かに1回だけやり直します。
+       やり直しても結果が変わらない操作だけです。 */
+    try {
+      return await this.callOnce(payload);
+    } catch (e){
+      const msg = String(e && e.message || '');
+      const canRetry = this.RETRYABLE.indexOf(payload.action) >= 0 &&
+        /接続できませんでした|応答が読めませんでした|応答しませんでした|ロック|Lock|timed out|しばらく/
+          .test(msg);
+      if (!canRetry) throw e;
+      await new Promise(r => setTimeout(r, 1200));
+      return this.callOnce(payload);
+    }
+  },
+
+  async callOnce(payload){
     const url = this.cfg.url;
     const body = Object.assign({ token: this.cfg.token, user: this.cfg.user }, payload);
     let res, txt;
@@ -940,7 +964,13 @@ const Store = {
         redirect: 'follow'
       });
       txt = await res.text();
+      if (!res.ok){
+        this.online = false;
+        throw new Error('スプレッドシートが応答しませんでした（' + res.status + '）。' +
+          '電波の良いところで、もう一度お試しください。');
+      }
     } catch (e) {
+      if (/応答しませんでした/.test(String(e && e.message))) throw e;
       this.online = false;
       throw new Error('スプレッドシートに接続できませんでした。電波と、設定のURLを確認してください。');
     }
@@ -1050,6 +1080,8 @@ const Store = {
           { updated_at: new Date().toISOString() });
         this.saveLocal(); return db[p.table][i];
       }
+      case 'benchmark':
+        return buildBenchmarkLocal(db, Object.assign({}, DEFAULTS, db.settings));
       case 'counts': {
         const n = t => (db[t] || []).length;
         return { cows: n('cows'), weights: n('weights'), milk_feed: n('milk_feed'),
@@ -1083,6 +1115,32 @@ const Store = {
         const i = db[p.table].findIndex(r => r.id === p.id);
         if (i >= 0) db[p.table].splice(i, 1);
         this.saveLocal(); return { deleted: true };
+      }
+      case 'replaceMany': {
+        let rep = 0, rem = 0;
+        (p.items || []).forEach(it => {
+          const m = it.match || {};
+          const keys = Object.keys(m);
+          const before = db[p.table].length;
+          db[p.table] = db[p.table].filter(x =>
+            !keys.every(k => String(x[k] ?? '') === String(m[k] ?? '')));
+          rem += before - db[p.table].length;
+          (it.rows || []).forEach(r => { db[p.table].push(stamp(r)); rep++; });
+        });
+        this.saveLocal(); return { replaced: rep, removed: rem };
+      }
+      case 'saveCowsMany': {
+        const out = (p.rows || []).map(row => {
+          const i = db.cows.findIndex(c => String(c.cow_no) === String(row.cow_no));
+          if (i < 0){ const n = stamp(row); db.cows.push(n); return n; }
+          const merged = Object.assign({}, db.cows[i]);
+          for (const k in row){
+            if (k === 'id' || k === 'created_at') continue;
+            merged[k] = row[k];
+          }
+          db.cows[i] = stamp(merged); return db.cows[i];
+        });
+        this.saveLocal(); return { rows: out };
       }
       case 'replace': {
         // 指定した条件に合う既存行を消してから入れ直す（訂正のため）
@@ -1187,7 +1245,9 @@ const Store = {
   apply(d){
     this.cows = (d.cows || []).map(normalizeCow);
     this.settings = Object.assign({}, DEFAULTS, d.settings || {});
-    this.benchmark = d.benchmark || null;
+    // 集計は起動では来ないことがある（画面が出たあとに裏で取りに行きます）。
+    // 前回のぶんを持っているなら、それを消さずに残します。
+    this.benchmark = d.benchmark || this.benchmark || null;
     // counts（各表の件数）は起動では受け取りません。Store.counts() で必要なときに数えます。
     // 直近のイベントを牛ごとに引けるようにしておく
     this.recentEvents = {};
@@ -1247,6 +1307,39 @@ const Store = {
     this.fromCache = true;
     this.cachedAt = o.at;
     return true;
+  },
+
+  /* ------------------------------------------------------------
+     牧場ぜんぶの集計（発育曲線・パーセンタイル）
+     ------------------------------------------------------------
+     これを作るには体重17,000行を読む必要があり、以前は起動のたびに
+     その計算を待っていました。しかも誰かが牛を1頭登録すると
+     覚え書きが捨てられるので、次に開いた人がまた待たされていました。
+
+     集計は「牧場ぜんぶの中央値」なので、1頭増えても動きません。
+     起動では待たず、画面が出たあとに裏で取りに行きます。
+     ------------------------------------------------------------ */
+  async ensureBenchmark(){
+    if (this.benchmark || !this.isRemote || this._bmTried) return this.benchmark;
+    this._bmTried = true;
+    try {
+      const bm = await this.call({ action: 'benchmark' });
+      if (bm && Object.keys(bm).length){
+        this.benchmark = bm;
+        this.patchInitCache({ benchmark: bm });   // 次に開いたときはすぐ出る
+      }
+    } catch (e){ /* 古いバックエンドでは、ただ出ないだけ */ }
+    return this.benchmark;
+  },
+
+  /** 前回の控えの一部だけを差し替える */
+  patchInitCache(patch){
+    try {
+      const o = this.loadInitCache();
+      if (!o) return;
+      Object.assign(o.d, patch);
+      this.saveInitCache(o.d);
+    } catch (e){ /* 使えなければ何もしない */ }
   },
 
   /** 表の件数（設定画面でだけ使う。起動では取りに行かない） */
@@ -1539,6 +1632,56 @@ const Store = {
     this.cacheReplace(table, match, rows);
     (rows || []).forEach(x => this.noteWrite(table, x));
     return r;
+  },
+
+  /* ------------------------------------------------------------
+     何頭ぶんもの「入れ直し」を1回で送る
+     ------------------------------------------------------------
+     哺乳ボードで30頭を保存すると、以前は1頭ずつ30往復していました。
+     1往復に数秒かかるので、押してから1分近く待つことになります。
+     まとめて1回で送れば、待ち時間は1往復ぶんで済みます。
+     スプレッドシート側が古くてこの操作を知らないときは、
+     これまでどおり1頭ずつ送ります（動かなくなることはありません）。
+     ------------------------------------------------------------ */
+  async replaceMany(table, items){
+    const list = (items || []).filter(x => x && x.match);
+    if (!list.length) return { replaced: 0, removed: 0 };
+    if (list.length === 1) return this.replace(table, list[0].match, list[0].rows || []);
+    try {
+      const r = await this.call({ action: 'replaceMany', table, items: list });
+      list.forEach(x => {
+        this.cacheReplace(table, x.match, x.rows || []);
+        (x.rows || []).forEach(y => this.noteWrite(table, y));
+      });
+      return r;
+    } catch (e){
+      if (!/不明な操作/.test(String(e && e.message))) throw e;
+      let n = 0;
+      for (const x of list){ await this.replace(table, x.match, x.rows || []); n++; }
+      return { replaced: n, removed: 0, fallback: true };
+    }
+  },
+
+  /** 何頭ぶんもの個体情報を1回で保存する（部屋の付け替えなど） */
+  async saveCowsMany(rows){
+    const list = (rows || []).filter(r => r && r.cow_no);
+    if (!list.length) return [];
+    if (list.length === 1) return [await this.saveCow(list[0])];
+    const apply = out => (out || []).map(r => {
+      const i = this.cows.findIndex(c => String(c.cow_no) === String(r.cow_no));
+      const merged = normalizeCow(Object.assign({}, i >= 0 ? this.cows[i] : {}, r));
+      if (i >= 0) this.cows[i] = merged; else this.cows.push(merged);
+      return merged;
+    });
+    try {
+      const d = await this.call({ action: 'saveCowsMany', rows: list });
+      return apply(d && d.rows);
+    } catch (e){
+      if (!/不明な操作/.test(String(e && e.message))) throw e;
+      const out = [];
+      for (const r of list) out.push(await this.saveCow(r));
+      return out;
+    }
   },
 
   async bulk(table, rows, dedupe){
@@ -5417,6 +5560,10 @@ function openBirthForm(cow){
       if (!no) no = 'M' + mgmt;
       let bw = fBW.value;
       if (!bw && fBC.value){ const w = Calc.estWeight(fBC.value); if (w) bw = r1(w); }
+      // 新しく登録する牛かどうかを、送る前に見ておく。
+      // 新しい牛には記録が1件も無いと分かっているので、
+      // このあとカルテを開くときに読みに行かなくて済みます（1往復ぶん速い）。
+      const wasKnown = Store.cows.some(c => String(c.cow_no) === String(no));
       const saved = await Store.saveCow({
         cow_no: no, mgmt_no: mgmt, neck_no: fNeck.value.trim(), name: fName.value.trim(),
         birth_date: fBirth.value, sex: fSex.value, breed: fBreed.value,
@@ -5426,6 +5573,11 @@ function openBirthForm(cow){
         pen: fPen.value.trim(), note: fNote.value.trim(), program: fProg.value,
         status: cow.status || '育成'
       });
+      if (!wasKnown){
+        const empty = {};
+        COW_CORE_TABLES.concat(COW_LAZY_TABLES).forEach(t => { empty[t] = []; });
+        Store.cache[String(saved.cow_no)] = empty;
+      }
       MilkBoard.reset();
       close(); toast(isNew ? '登録しました' : '保存しました');
       searchBuf = '';
@@ -6478,12 +6630,12 @@ function viewBulk(kind){
     if (!rows.length) throw new Error('入力された値がありません');
     const table = kind === 'milk' ? 'milk_feed' : kind === 'starter' ? 'starter' : 'weights';
     // 牛ごとに「その日の記録」を入れ直す。二度押しても増えず、直した値が残ります。
-    let n = 0;
-    for (const row of rows){
-      await Store.replace(table, { cow_no: row.cow_no, date: row.date }, [row]);
-      n++;
-      btn.innerHTML = ''; btn.appendChild(document.createTextNode('保存中… ' + n + '/' + rows.length));
-    }
+    // 以前は1頭ずつ順に送っていて、頭数ぶん待たされていました。まとめて1回で送ります。
+    btn.innerHTML = '';
+    btn.appendChild(el('span', { class: 'spinner' }));
+    btn.appendChild(document.createTextNode(' 保存中… ' + rows.length + '頭'));
+    await Store.replaceMany(table,
+      rows.map(row => ({ match: { cow_no: row.cow_no, date: row.date }, rows: [row] })));
     Analysis.reset(); MilkBoard.reset();
     toast(rows.length + '頭分 保存しました');
     App.go('entry');
@@ -9298,6 +9450,10 @@ function viewMilkBoard(){
     const colo = num(Calc.S()['group.colostrum_days'], 3);
     let saved = 0, cows = 0;
 
+    /* 以前は1頭ずつ順番に送っていました。1往復に数秒かかるので、
+       30頭だと押してから1分近く待つことになります。
+       ここでぜんぶ組み立ててから、まとめて1回で送ります。 */
+    const feedItems = [], eventItems = [];
     for (const r of MilkBoard.rows){
       const a = num(r.am), p2 = num(r.pm);
       if (a == null && p2 == null) continue;   // 量が入っていない牛は何もしない
@@ -9317,17 +9473,22 @@ function viewMilkBoard(){
       if (!rows.length) continue;
       // その牛のその日の記録を入れ直す。
       // 何度保存しても増えず、直した値がそのまま残ります。
-      await Store.replace('milk_feed', { cow_no: r.cow.cow_no, date: MilkBoard.date }, rows);
+      feedItems.push({ match: { cow_no: r.cow.cow_no, date: MilkBoard.date }, rows });
       saved += rows.length; cows++;
 
       if (r.feces && r.feces !== '正常')
-        await Store.replace('events',
-          { cow_no: r.cow.cow_no, date: MilkBoard.date, type: '便異常' },
-          [{ cow_no: r.cow.cow_no, date: MilkBoard.date, type: '便異常',
-             detail: r.feces, note: r.note || '' }]);
+        eventItems.push({
+          match: { cow_no: r.cow.cow_no, date: MilkBoard.date, type: '便異常' },
+          rows: [{ cow_no: r.cow.cow_no, date: MilkBoard.date, type: '便異常',
+                   detail: r.feces, note: r.note || '' }] });
+    }
 
+    if (saved){
       btn.innerHTML = '';
-      btn.appendChild(document.createTextNode('保存中… ' + cows + '頭'));
+      btn.appendChild(el('span', { class: 'spinner' }));
+      btn.appendChild(document.createTextNode(' 保存中… ' + cows + '頭'));
+      await Store.replaceMany('milk_feed', feedItems);
+      if (eventItems.length) await Store.replaceMany('events', eventItems);
     }
     if (!saved){
       const done = MilkBoard.rows.filter(r => r.saved).length;
@@ -10783,8 +10944,8 @@ function openPenForm(pen){
       } else {
         await Store.edit('pens', pen.id, row);
         if (pen.name && pen.name !== name){
-          for (const c of Pens.cowsIn(pen.name))
-            await Store.saveCow({ cow_no: c.cow_no, pen: name });
+          await Store.saveCowsMany(
+            Pens.cowsIn(pen.name).map(c => ({ cow_no: c.cow_no, pen: name })));
         }
       }
       MilkBoard.reset();
@@ -10797,8 +10958,8 @@ function openPenForm(pen){
       const del = el('button', { class: 'btn danger ghost', style: 'margin-top:9px' },
         L.n ? 'この部屋を消す（' + L.n + '頭は部屋なしに戻ります）' : 'この部屋を消す');
       del.onclick = () => submitting(del, async () => {
-        for (const c of Pens.cowsIn(pen.name))
-          await Store.saveCow({ cow_no: c.cow_no, pen: '' });
+        await Store.saveCowsMany(
+          Pens.cowsIn(pen.name).map(c => ({ cow_no: c.cow_no, pen: '' })));
         await Store.del('pens', pen.id);
         MilkBoard.reset();
         if (PenView.open === pen.name) PenView.open = null;
@@ -10996,7 +11157,7 @@ async function seedPens(wipe){
       const n = String(c.pen || '').trim();
       return n && !keep.has(n);
     });
-    for (const c of lost) await Store.saveCow({ cow_no: c.cow_no, pen: '' });
+    await Store.saveCowsMany(lost.map(c => ({ cow_no: c.cow_no, pen: '' })));
     for (const p of old) await Store.del('pens', p.id);
   }
   const rows = PEN_SEED.map(p => {
@@ -11203,6 +11364,8 @@ const Updater = {
     App.ready = true;
     App.render();
     if (!Store.isRemote && !Store.cows.length) showWelcome();
+    // 牧場ぜんぶの集計（発育曲線・パーセンタイル）は、画面が出たあとに取りに行く
+    Store.ensureBenchmark().then(bm => { if (bm) App.render(); }).catch(() => {});
     // 画面が出たあと、裏でよく開く牛のぶんを取っておく
     setTimeout(warmLikelyCows, 400);
   } catch (e){
