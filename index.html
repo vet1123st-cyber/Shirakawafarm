@@ -412,6 +412,14 @@ figure.chart figcaption{font-size:var(--t1);color:var(--muted);margin-top:8px;li
   line-height:1.7}
 .empty .big{font-size:calc(38px * var(--fs));margin-bottom:8px;opacity:.5}
 
+/* カルテの上の枠に置く「よく見る4つ」（母・NM$・出生体重・精液） */
+.facts{display:grid;grid-template-columns:1fr 1fr;gap:7px 10px;margin:0 0 13px}
+.facts>div{display:flex;gap:7px;align-items:baseline;min-width:0}
+.facts .k{color:var(--muted);font-size:var(--tmicro);flex:none;width:54px}
+.facts .v{font-size:var(--t1);font-weight:650;font-variant-numeric:tabular-nums;
+          min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.facts .v.none{font-weight:400;color:var(--muted)}
+.facts a{color:var(--s1);text-decoration:none}
 .kv{display:grid;grid-template-columns:auto 1fr;gap:8px 15px;font-size:var(--t2)}
 .kv dt{color:var(--muted);font-size:var(--t1)}
 .kv dd{margin:0;font-variant-numeric:tabular-nums}
@@ -878,14 +886,14 @@ const EVENT_TYPES = ['増乳開始','ピーク到達','減乳開始','離乳','�
  *               表や列が増えたときだけ上げる。上げたら Code.gs のデプロイも必要。
  * BUILD_ID     … この index.html を作った日時。作るたびに毎回変わる。
  *               「新しい画面が出ていないか」を見るためだけに使う。
- *               build.sh が 2026-09-06-0917 を実際の日時に置き換えます。
+ *               build.sh が 2026-09-10-0335 を実際の日時に置き換えます。
  */
 /* カルテを開いた瞬間に要る表と、タブを開いたときでいい表 */
 const COW_CORE_TABLES = ['weights', 'milk_feed', 'starter', 'repro', 'events', 'colostrum'];
 const COW_LAZY_TABLES = ['genomics', 'milk_test'];
 
 const APP_VERSION = '2026-09-07a';
-const BUILD_ID = '2026-09-06-0917';
+const BUILD_ID = '2026-09-10-0335';
 const REQUIRED_TABLES = ['cows', 'weights', 'milk_feed', 'starter', 'repro', 'events',
                          'genomics', 'milk_test', 'colostrum', 'pens', 'daily_check',
                          'milk_plan', 'settings'];
@@ -1256,6 +1264,8 @@ const Store = {
      でも最初の画面に要るのは体重・哺乳・スターター・繁殖・記録・初乳だけです。
      ゲノムと乳検は、そのタブを開いたときに取りに行きます。
      ------------------------------------------------------------ */
+  _inflight: {},
+
   async cow(no, opts){
     opts = opts || {};
     const key = String(no);
@@ -1264,6 +1274,20 @@ const Store = {
     const missing = want.filter(t => !have || !have[t]);
     if (!missing.length) return have;
 
+    /* 同じ牛の同じ表を、同時に2か所から頼まれることがあります
+       （カルテの上の枠の NM$ と、概要タブのゲノム欄など）。
+       そのまま出すと、まったく同じ往復を2回することになるので、
+       先に走っているほうに相乗りします。 */
+    const fkey = key + '|' + missing.slice().sort().join(',');
+    if (this._inflight[fkey]) return this._inflight[fkey];
+    const pr = this._cowFetch(key, missing);
+    this._inflight[fkey] = pr;
+    try { return await pr; }
+    finally { delete this._inflight[fkey]; }
+  },
+
+  async _cowFetch(key, missing){
+    const have = this.cache[key];
     const d = await this.call({ action: 'cow', cow_no: key, tables: missing });
     const rec = have || {};
     // 返ってきたものは全部しまう（古いバックエンドは頼んでいない表も返してくる）
@@ -1315,6 +1339,57 @@ const Store = {
   },
 
   invalidate(no){ if (no != null) delete this.cache[String(no)]; },
+
+  /* ------------------------------------------------------------
+     書いたぶんだけ、手元の控えを直す
+     ------------------------------------------------------------
+     以前は1件保存するたびに控えを丸ごと捨てていました。
+     捨てると、そのあと画面を描き直すときにもう1往復（数秒）かかり、
+     さらに起動時にまとめて取っておいた150頭ぶんも全部消えるので、
+     「1頭入力するたびに、そのあとずっと重くなる」状態でした。
+
+     いま書いた中身は手元で分かっているので、その行だけ差し替えます。
+     ------------------------------------------------------------ */
+
+  /** その牛の、その表の控えに1行足す */
+  cachePush(table, row){
+    const no = String(row && row.cow_no || '');
+    if (!no) return;
+    const rec = this.cache[no];
+    if (!rec || !rec[table]) return;          // まだ読んでいない表は触らない
+    rec[table] = rec[table].filter(x => !(row.id && String(x.id) === String(row.id)));
+    rec[table].push(Object.assign({}, row));
+    this.cacheSort(rec, table);
+  },
+
+  /** その牛の、その表の控えから1行消す */
+  cacheDrop(table, id, cowNo){
+    const no = String(cowNo == null ? '' : cowNo);
+    const recs = no ? [this.cache[no]] : Object.values(this.cache);
+    recs.forEach(rec => {
+      if (!rec || !rec[table]) return;
+      rec[table] = rec[table].filter(x => String(x.id) !== String(id));
+    });
+  },
+
+  /** 「同じ条件の行を入れ直す」を、控えの上でもやる */
+  cacheReplace(table, match, rows){
+    const m = match || {};
+    const no = m.cow_no == null ? '' : String(m.cow_no);
+    if (!no){ this.cache = {}; return; }       // 牛が決まらないときだけ、全部捨てる
+    const rec = this.cache[no];
+    if (!rec || !rec[table]) return;
+    const keys = Object.keys(m);
+    rec[table] = rec[table].filter(x =>
+      !keys.every(k => String(x[k] ?? '') === String(m[k] ?? '')));
+    (rows || []).forEach(x => rec[table].push(Object.assign({ id: uid() }, x)));
+    this.cacheSort(rec, table);
+  },
+
+  cacheSort(rec, table){
+    if (rec && rec[table])
+      rec[table].sort((a, b) => String(a.date) < String(b.date) ? -1 : 1);
+  },
 
   /* ------------------------------------------------------------
      保存したあとの手当て
@@ -1406,13 +1481,14 @@ const Store = {
 
   async add(table, row){
     const r = await this.call({ action: 'append', table, row });
-    this.invalidate(row.cow_no);
-    this.noteWrite(table, Object.assign({}, row, r || {}));
+    const full = Object.assign({ id: uid() }, row, r || {});
+    this.cachePush(table, full);
+    this.noteWrite(table, full);
     return r;
   },
   async edit(table, id, row){
     const r = await this.call({ action: 'update', table, id, row });
-    this.invalidate(row.cow_no);
+    this.cachePush(table, Object.assign({ id }, row));
     this.noteWrite(table, Object.assign({ id }, row));
     return r;
   },
@@ -1439,7 +1515,7 @@ const Store = {
   },
   async del(table, id, cow_no){
     const r = await this.call({ action: 'remove', table, id });
-    this.invalidate(cow_no);
+    this.cacheDrop(table, id, cow_no);
     this.noteDelete(table, id);
     return r;
   },
@@ -1448,7 +1524,8 @@ const Store = {
     const i = this.cows.findIndex(c => String(c.cow_no) === String(row.cow_no));
     const merged = normalizeCow(Object.assign({}, i >= 0 ? this.cows[i] : {}, r));
     if (i >= 0) this.cows[i] = merged; else this.cows.push(merged);
-    this.invalidate(row.cow_no);
+    // 個体の基本情報は Store.cows に入っており、記録の控えとは別。
+    // ここで控えを捨てると、開き直すたびに読み直しになるので捨てません。
     return merged;
   },
   async saveSettings(obj){
@@ -1459,15 +1536,20 @@ const Store = {
   /** 同じ条件の記録を入れ直す（訂正のときに使う） */
   async replace(table, match, rows){
     const r = await this.call({ action: 'replace', table, match, rows });
-    this.cache = {};
-    if (match && match.cow_no) this.invalidate(match.cow_no);
+    this.cacheReplace(table, match, rows);
     (rows || []).forEach(x => this.noteWrite(table, x));
     return r;
   },
 
   async bulk(table, rows, dedupe){
     const r = await this.call({ action: 'bulk', table, rows, dedupe: dedupe || null });
-    this.cache = {};
+    // 取り込みは行数が多く、どの行がどうなったかを手元で追えないので、
+    // 触った牛のぶんだけ控えを捨てます（触っていない牛はそのまま）。
+    const seen = {};
+    (rows || []).forEach(x => { if (x && x.cow_no != null) seen[String(x.cow_no)] = 1; });
+    const nos = Object.keys(seen);
+    if (nos.length) nos.forEach(no => this.invalidate(no));
+    else this.cache = {};
     (rows || []).forEach(x => this.noteWrite(table, x));
     return r;
   }
@@ -1842,6 +1924,26 @@ function pctl(sorted, p){
 const Calc = {
   S(){ return Store.settings; },
 
+  /* ------------------------------------------------------------
+     設定から作るものを、1回だけ作って覚えておく
+     ------------------------------------------------------------
+     プログラム（「20:3.0, 30:3.75, …」という文字列）は、
+     使うたびに読み直して120日ぶんの配列を組み立てていました。
+     牛群の画面では1頭ごとに何度も呼ばれるので、300頭なら
+     1回描くだけで千回以上この組み立てが走り、画面が重くなっていました。
+
+     設定が変わったときだけ作り直せばよいので、覚えておきます。
+     （Store.settings は設定を保存したときに丸ごと入れ替わるので、
+       その「入れ替わったかどうか」を目印にします）
+     ------------------------------------------------------------ */
+  _memo: { s: null, m: {} },
+  memo(key, make){
+    if (this._memo.s !== Store.settings) this._memo = { s: Store.settings, m: {} };
+    const m = this._memo.m;
+    if (!(key in m)) m[key] = make();
+    return m[key];
+  },
+
   /** 胸囲(cm) → 推定体重(kg)。この牧場の実測データから導いた式 */
   estWeight(chestCm){
     const c = num(chestCm); if (c == null || c <= 0) return null;
@@ -2012,8 +2114,8 @@ const Calc = {
   perDay(){ return num(this.S()['program.feedings_per_day'], 2) || 2; },
 
   programKeys(){
-    return String(this.S()['program.keys'] || 'a,b')
-      .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+    return this.memo('keys', () => String(this.S()['program.keys'] || 'a,b')
+      .split(',').map(s => s.trim().toLowerCase()).filter(Boolean));
   },
 
   /** 牛が属する群のキー。未設定なら品種と出生体重から提案 */
@@ -2045,6 +2147,9 @@ const Calc = {
   },
 
   programMeta(key){
+    return this.memo('meta:' + String(key || ''), () => this.programMetaNow(key));
+  },
+  programMetaNow(key){
     const S = this.S();
     const keys = this.programKeys();
     const k = keys.includes(String(key || '').toLowerCase())
@@ -2061,6 +2166,9 @@ const Calc = {
 
   /** 「日齢 → 1回あたりL / 1日あたりL」の配列に展開 */
   program(key){
+    return this.memo('prog:' + String(key || ''), () => this.programNow(key));
+  },
+  programNow(key){
     const meta = this.programMeta(key);
     const per = this.perDay();
     const pts = String(meta.raw).split(',').map(s => {
@@ -2228,6 +2336,9 @@ const Calc = {
   },
 
   programMaxPctBW(key){
+    return this.memo('maxpct:' + String(key || ''), () => this.programMaxPctBWNow(key));
+  },
+  programMaxPctBWNow(key){
     const p = this.program(key);
     if (!p.length) return null;
     let max = null;
@@ -2312,6 +2423,9 @@ const Calc = {
   },
 
   programMarks(key){
+    return this.memo('marks:' + String(key || ''), () => this.programMarksNow(key));
+  },
+  programMarksNow(key){
     const p = this.program(key);
     if (!p.length) return {};
     let peakL = 0, peakStart = null, peakEnd = null, rampStart = null, weanDay = null;
@@ -3953,6 +4067,10 @@ function cowHeader(cow, a){
       : (cow.status ? el('span', { class: 'badge' }, cow.status) : null));
   if (tags.childNodes.length) c.appendChild(tags);
 
+  // よく見る4つ（母の4桁・NM$・出生体重・精液）。
+  // これまでは概要タブの血統カードまで下りないと見えませんでした。
+  c.appendChild(cowFacts(cow, a));
+
   // 牧場を出ている牛は、そのことを一番上ではっきり出す。
   // 記録は残っているので、開いたときに「なぜ哺乳画面に居ないのか」が分かるように。
   if (isAwayStatus(cow.status)){
@@ -3988,6 +4106,96 @@ function cowHeader(cow, a){
     yd && yd.feces && yd.feces !== '正常' ? 'bad' : ''));
   c.appendChild(tiles);
   return c;
+}
+
+/* ------------------------------------------------------------
+   カルテの上の枠に出す「よく見る4つ」
+   ------------------------------------------------------------
+   母の4桁・NM$・出生体重・精液。
+   どれも「開いた瞬間に見たい」のに、これまでは概要タブの
+   血統カードまで下りないと見えませんでした。
+
+   NM$ だけはゲノム表にあり、行数が多くて読むのに時間がかかります。
+   カルテ全体をそれで待たせたくないので、ここだけ後から埋めます。
+   ------------------------------------------------------------ */
+
+/** ゲノムの記録から NM$ を1つ選ぶ。自身 → 母 → 父 → 使用精液 の順 */
+function nmOf(rows){
+  const list = (rows || []).filter(g => String(g.trait || '') === 'NM$' &&
+                                        String(g.value || '') !== '');
+  if (!list.length) return null;
+  const order = ['自身', '母', '父', '使用精液'];
+  for (const sub of order){
+    const hit = list.filter(g => String(g.subject || '自身') === sub);
+    if (!hit.length) continue;
+    // 同じ対象が何度も測ってあるときは、新しいほうを使う
+    hit.sort((a, b) => String(a.tested_at) < String(b.tested_at) ? 1 : -1);
+    return { subject: sub, value: hit[0].value, tested_at: hit[0].tested_at };
+  }
+  return null;
+}
+
+function factCell(k, v, cls){
+  return el('div', {},
+    el('span', { class: 'k' }, k),
+    el('span', { class: 'v' + (cls ? ' ' + cls : '') }, v));
+}
+
+function cowFacts(cow, a){
+  const box = el('div', { class: 'facts' });
+
+  /* 母 — 登録されていれば押してその牛へ飛べる */
+  const dam = damOf(cow);
+  const damNo = String(cow.dam_mgmt_no || '').trim() ||
+                (cow.dam_no ? mid4(cow.dam_no) : '');
+  box.appendChild(el('div', {},
+    el('span', { class: 'k' }, '母'),
+    dam
+      ? el('a', { class: 'v', href: '#', title: dam.name || '',
+          onclick: e => { e.preventDefault(); App.openCow(dam.cow_no); } },
+          dam.tag4 + (dam.name ? '　' + dam.name : ''))
+      : el('span', { class: 'v' + (damNo ? '' : ' none') },
+          damNo || '未登録')));
+
+  /* NM$ — ゲノムが手元に無ければ、あとから埋める */
+  const nmCell = el('div', {}, el('span', { class: 'k' }, 'NM$'));
+  const nmVal = el('span', { class: 'v none' });
+  const drawNm = () => {
+    const n = nmOf(a.rec.genomics);
+    nmVal.innerHTML = '';
+    if (!n){ nmVal.className = 'v none'; nmVal.textContent = '未登録'; return; }
+    nmVal.className = 'v';
+    nmVal.appendChild(document.createTextNode(String(n.value)));
+    if (n.subject !== '自身')
+      nmVal.appendChild(el('span', { class: 'k', style: 'width:auto;margin-left:5px' },
+        n.subject));
+  };
+  if (a.rec.genomics){ drawNm(); }
+  else {
+    nmVal.appendChild(el('span', { class: 'spinner sm' }));
+    Store.cow(cow.cow_no, { tables: ['genomics'] }).then(rec2 => {
+      if (String(App.cowNo) !== String(cow.cow_no) || !nmVal.isConnected) return;
+      a.rec.genomics = rec2.genomics || [];
+      drawNm();
+    }).catch(() => { if (nmVal.isConnected){ nmVal.className = 'v none';
+                                             nmVal.textContent = '—'; } });
+  }
+  nmCell.appendChild(nmVal);
+  box.appendChild(nmCell);
+
+  /* 出生体重 */
+  const bw = a.birthWeight != null ? a.birthWeight : num(cow.birth_weight);
+  box.appendChild(factCell('出生体重',
+    bw != null ? r1(bw) + ' kg' : '未登録', bw != null ? '' : 'none'));
+
+  /* 精液（種雄牛）。名前が長いので、はみ出す分は … にして、押すと全部出す */
+  const sire = [cow.sire_code, cow.sire_name].filter(Boolean).join(' ');
+  box.appendChild(el('div', {},
+    el('span', { class: 'k' }, '精液'),
+    el('span', { class: 'v' + (sire ? '' : ' none'), title: sire || '',
+      onclick: () => { if (sire) toast(sire); } }, sire || '未登録')));
+
+  return box;
 }
 
 function cowTile(k, v, unit, d, cls){
@@ -10974,17 +11182,19 @@ const Updater = {
 /* 起動処理 */
 (async function boot(){
   App.render();
-  // 画面より先に、新しい版が出ていないかを確かめる。
-  // 新しければここで読み直しが走るので、この先は動きません。
-  await Updater.check();
 
-  // 前回この端末で読んだ内容があれば、待たずにそれを出す。
-  // スプレッドシートとの往復には数秒かかるので、その間を白い画面にしない。
+  /* 前回この端末で読んだ内容があれば、いちばん先にそれを出す。
+     以前はここより前で version.txt を待っていました。数十バイトでも
+     電波の悪いところでは1〜2秒かかり、そのあいだ白い画面のままでした。
+     見せるものは先に見せて、版の確認と本体の読み込みは裏で同時に走らせます。 */
   if (Store.initFromCache()){
     Analysis.reset(); MilkBoard.reset();
     App.ready = true;
     App.render();
   }
+
+  // 新しい版が出ていないかの確認。待たない（新しければ、この中で読み直しが走る）
+  Updater.check().catch(() => {});
 
   try {
     await Store.init();
@@ -11031,10 +11241,12 @@ async function warmLikelyCows(){
     if (!nos.length) return;
     // まず、カルテを開いた瞬間に要るぶん（約226KB）
     await Store.prefetch(nos);
-    // 少し置いてから、ゲノムも（約189KB）。
-    // これで概要のゲノム欄も待ち時間なしになります。
-    await new Promise(r => setTimeout(r, 1500));
-    await Store.prefetch(nos, ['genomics']);
+    /* 少し置いてから、ゲノムも。
+       カルテの上の枠に出す NM$ と、概要のゲノム欄がこれで待ち時間なしになります。
+       ただし裏で大きな通信が走っていると、そのあいだ画面の操作がもたつくので、
+       間を空けて、頭数も絞ります。取れなかった牛は、開いたときに1頭だけ取りに行きます。 */
+    await new Promise(r => setTimeout(r, 3000));
+    await Store.prefetch(nos.slice(0, 100), ['genomics']);
   } catch (e){ /* 古いスプレッドシート側でも、ただ効かないだけ */ }
 }
 
