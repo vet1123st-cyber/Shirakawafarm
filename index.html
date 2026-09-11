@@ -886,14 +886,14 @@ const EVENT_TYPES = ['増乳開始','ピーク到達','減乳開始','離乳','�
  *               表や列が増えたときだけ上げる。上げたら Code.gs のデプロイも必要。
  * BUILD_ID     … この index.html を作った日時。作るたびに毎回変わる。
  *               「新しい画面が出ていないか」を見るためだけに使う。
- *               build.sh が 2026-09-10-0434 を実際の日時に置き換えます。
+ *               build.sh が 2026-09-10-0504 を実際の日時に置き換えます。
  */
 /* カルテを開いた瞬間に要る表と、タブを開いたときでいい表 */
 const COW_CORE_TABLES = ['weights', 'milk_feed', 'starter', 'repro', 'events', 'colostrum'];
 const COW_LAZY_TABLES = ['genomics', 'milk_test'];
 
 const APP_VERSION = '2026-09-10a';
-const BUILD_ID = '2026-09-10-0434';
+const BUILD_ID = '2026-09-10-0504';
 const REQUIRED_TABLES = ['cows', 'weights', 'milk_feed', 'starter', 'repro', 'events',
                          'genomics', 'milk_test', 'colostrum', 'pens', 'daily_check',
                          'milk_plan', 'settings'];
@@ -1017,9 +1017,25 @@ const Store = {
     const stamp = r => Object.assign({ id: r.id || uid(), updated_at: new Date().toISOString(),
                                        updated_by: this.cfg.user || '' }, r);
     switch (p.action){
-      case 'init':
+      case 'init': {
         const since = addDays(today(), -21);
-        return { cows: db.cows, settings: Object.assign({}, DEFAULTS, db.settings),
+        // 0日齢（生まれた日）の体重があれば、出生体重として扱う
+        const bw0 = {};
+        (db.weights || []).forEach(w => {
+          const c = db.cows.find(x => String(x.cow_no) === String(w.cow_no));
+          if (!c || !c.birth_date) return;
+          if (ymd(w.date) !== ymd(c.birth_date)) return;
+          const kg = num(w.weight_actual) ?? Calc.estWeight(w.chest_cm);
+          if (kg == null || kg <= 0) return;
+          if (bw0[String(w.cow_no)] === undefined)
+            bw0[String(w.cow_no)] = Math.round(kg * 10) / 10;
+        });
+        const cowsOut = db.cows.map(c => {
+          const k0 = bw0[String(c.cow_no)];
+          if (k0 == null || (c.birth_weight !== '' && c.birth_weight != null)) return c;
+          return Object.assign({}, c, { birth_weight: k0, bw0: 1 });
+        });
+        return { cows: cowsOut, settings: Object.assign({}, DEFAULTS, db.settings),
                  benchmark: buildBenchmarkLocal(db, Object.assign({}, DEFAULTS, db.settings)),
                  recentEvents: db.events.filter(e => String(e.date) >= since)
                    .map(e => ({ cow_no: e.cow_no, date: e.date, type: e.type, detail: e.detail })),
@@ -1050,6 +1066,7 @@ const Store = {
                            repro: db.repro.length, milk_test: db.milk_test.length,
                            genomics: db.genomics.length,
                            colostrum: (db.colostrum || []).length } };
+      }
       case 'cow': {
         const no = String(p.cow_no);
         const f = t => (db[t] || []).filter(r => String(r.cow_no) === no);
@@ -2613,7 +2630,19 @@ const Calc = {
     pts.sort((a,b) => a.day - b.day);
     out.weights = pts;
     out.latest = pts.length ? pts[pts.length - 1] : null;
+
+    /* 出生体重。
+       個体情報に入っていなくても、0日齢（生まれた日）に体重を測ってあれば
+       それが出生体重です。現場では体重の記録として入れることが多いので、
+       同じものとして扱います。 */
     out.birthWeight = bw;
+    out.birthWeightFromWeight = false;
+    if (out.birthWeight == null || !(out.birthWeight > 0)){
+      const z = pts.find(p => p.day === 0 && p.kg > 0);
+      if (z){ out.birthWeight = z.kg; out.birthWeightFromWeight = true; }
+    } else if (String(cow.bw0) === '1'){
+      out.birthWeightFromWeight = true;      // 起動時に0日齢の体重から埋めたもの
+    }
 
     /* --- 増体（DG） --- */
     out.dgOverall = null; out.dgRecent = null;
@@ -4326,10 +4355,15 @@ function cowFacts(cow, a){
   nmCell.appendChild(nmVal);
   box.appendChild(nmCell);
 
-  /* 出生体重 */
+  /* 出生体重（0日齢に測った体重も、出生体重として出す） */
   const bw = a.birthWeight != null ? a.birthWeight : num(cow.birth_weight);
-  box.appendChild(factCell('出生体重',
-    bw != null ? r1(bw) + ' kg' : '未登録', bw != null ? '' : 'none'));
+  box.appendChild(el('div', {},
+    el('span', { class: 'k' }, '出生体重'),
+    el('span', { class: 'v' + (bw != null ? '' : ' none'),
+      title: a.birthWeightFromWeight ? '0日齢に測った体重です' : '' },
+      bw != null ? r1(bw) + ' kg' : '未登録',
+      a.birthWeightFromWeight
+        ? el('span', { class: 'k', style: 'width:auto;margin-left:5px' }, '0日齢') : null)));
 
   /* 精液（種雄牛）。名前が長いので、はみ出す分は … にして、押すと全部出す */
   const sire = [cow.sire_code, cow.sire_name].filter(Boolean).join(' ');
@@ -4374,7 +4408,8 @@ function cowNumbersCard(cow, a){
       a.percentile.pct >= 50 ? 'good' : a.percentile.pct < 25 ? 'bad' : ''));
 
   tiles.appendChild(cowTile('出生体重', a.birthWeight ? r1(a.birthWeight) : '—', 'kg',
-    cow.birth_chest ? '胸囲 ' + r1(num(cow.birth_chest)) + 'cm' : null));
+    a.birthWeightFromWeight ? '0日齢に測った体重'
+      : cow.birth_chest ? '胸囲 ' + r1(num(cow.birth_chest)) + 'cm' : null));
 
   c.appendChild(tiles);
   return c;
@@ -4397,7 +4432,8 @@ function tabOverview(v, cow, a){
     el('span', { style: 'font-size:calc(11.5px * var(--fs));color:var(--muted)' },
       !a.programAuto ? '手動で設定'
         : /和牛|黒毛/.test(cow.breed || '') ? '品種から自動で判定'
-        : a.birthWeight != null ? '出生体重から自動で判定'
+        : a.birthWeight != null
+          ? (a.birthWeightFromWeight ? '0日齢の体重から自動で判定' : '出生体重から自動で判定')
         : '出生体重が未登録のため既定の群',
       '　離乳 ' + r0(f.weanMin) + '〜' + r0(f.weanMax) + '日'),
     el('button', { class: 'btn sm ghost', style: 'margin-left:auto',
@@ -5539,6 +5575,11 @@ function openBirthForm(cow){
     b.appendChild(field('名号 <span class="opt">任意</span>', fName));
     b.appendChild(el('div', { class: 'grid2' },
       field('出生体重 (kg)', fBW), field('出生時の胸囲 (cm)', fBC)));
+    // 0日齢に測った体重から入れてあるときは、そう分かるようにしておく
+    if (String(cow.bw0) === '1' && cow.birth_weight)
+      b.appendChild(el('div', { class: 'hint' },
+        '0日齢（生まれた日）に測った体重 ', el('b', {}, r1(num(cow.birth_weight)) + ' kg'),
+        ' を出生体重として出しています。このまま保存すると個体情報にも残ります。'));
     b.appendChild(estOut);
     b.appendChild(field('哺乳プログラムの群', fProg,
       '空欄なら、和牛は和牛用の群へ、ホルスタインは出生体重が牧場の下位25%に入る子を発育停滞群へ自動で振り分けます。'));
