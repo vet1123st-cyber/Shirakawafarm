@@ -905,7 +905,7 @@ const EVENT_TYPES = ['増乳開始','ピーク到達','減乳開始','離乳','�
  *               表や列が増えたときだけ上げる。上げたら Code.gs のデプロイも必要。
  * BUILD_ID     … この index.html を作った日時。作るたびに毎回変わる。
  *               「新しい画面が出ていないか」を見るためだけに使う。
- *               build.sh が 2026-09-11-0416 を実際の日時に置き換えます。
+ *               build.sh が 2026-09-11-0510 を実際の日時に置き換えます。
  */
 /* カルテを開いた瞬間に要る表と、タブを開いたときでいい表 */
 const COW_CORE_TABLES = ['weights', 'milk_feed', 'starter', 'repro', 'events', 'colostrum'];
@@ -917,7 +917,7 @@ const APP_VERSION = '2026-09-10a';
    以前は BUILD_ID を目印にしていたので、画面を1文字直して作り直すたびに
    全員の控えが捨てられ、更新した日の朝だけ待たされていました。 */
 const DATA_SHAPE = '3';
-const BUILD_ID = '2026-09-11-0416';
+const BUILD_ID = '2026-09-11-0510';
 const REQUIRED_TABLES = ['cows', 'weights', 'milk_feed', 'starter', 'repro', 'events',
                          'genomics', 'milk_test', 'colostrum', 'pens', 'daily_check',
                          'milk_plan', 'settings'];
@@ -955,7 +955,7 @@ const Store = {
      append（1行足す）と bulk（取り込み）は、送り直すと二重になるので入れません。 */
   RETRYABLE: ['init', 'cow', 'cowsBulk', 'counts', 'benchmark', 'export',
               'replace', 'replaceMany', 'update', 'updateMany', 'remove',
-              'saveCow', 'saveCowsMany', 'saveSettings', 'ping'],
+              'saveCow', 'saveCowsMany', 'batch', 'saveSettings', 'ping'],
 
   async call(payload){
     if (!this.isRemote) return this.local(payload);
@@ -1071,11 +1071,14 @@ const Store = {
           if (bw0[String(w.cow_no)] === undefined)
             bw0[String(w.cow_no)] = Math.round(kg * 10) / 10;
         });
-        const cowsOut = db.cows.map(c => {
-          const k0 = bw0[String(c.cow_no)];
-          if (k0 == null || (c.birth_weight !== '' && c.birth_weight != null)) return c;
-          return Object.assign({}, c, { birth_weight: k0, bw0: 1 });
-        });
+        const cowsOut = db.cows
+          // 死んだ牛は名簿に出さない（記録は消していません）
+          .filter(c => String(c.status || '') !== '死亡')
+          .map(c => {
+            const k0 = bw0[String(c.cow_no)];
+            if (k0 == null || (c.birth_weight !== '' && c.birth_weight != null)) return c;
+            return Object.assign({}, c, { birth_weight: k0, bw0: 1 });
+          });
         return { cows: cowsOut, settings: Object.assign({}, DEFAULTS, db.settings),
                  benchmark: buildBenchmarkLocal(db, Object.assign({}, DEFAULTS, db.settings)),
                  recentEvents: db.events.filter(e => String(e.date) >= since)
@@ -1186,6 +1189,10 @@ const Store = {
           (it.rows || []).forEach(r => { db[p.table].push(stamp(r)); rep++; });
         });
         this.saveLocal(); return { replaced: rep, removed: rem };
+      }
+      case 'batch': {
+        this.runOpsLocal(p.ops);
+        return { results: [] };
       }
       case 'saveCowsMany': {
         const out = (p.rows || []).map(row => {
@@ -1720,6 +1727,53 @@ const Store = {
     }
   },
 
+  /* ------------------------------------------------------------
+     いくつかの操作を、1回のやりとりでまとめて送る
+     ------------------------------------------------------------
+     「死亡・出荷にする」は個体情報と出来事の2つを書くので、
+     以前は2往復＝13秒かかっていました。まとめれば1往復です。
+     ------------------------------------------------------------ */
+  applyOpsLocal(ops){
+    const putCow = row => {
+      if (!row || !row.cow_no) return;
+      const i = this.cows.findIndex(c => String(c.cow_no) === String(row.cow_no));
+      if (i >= 0) this.cows[i] = normalizeCow(Object.assign({}, this.cows[i], row));
+      else this.cows.push(normalizeCow(row));
+    };
+    (ops || []).forEach(op => {
+      if (op.action === 'saveCow') putCow(op.row);
+      else if (op.action === 'saveCowsMany') (op.rows || []).forEach(putCow);
+      else if (op.action === 'replace'){
+        this.cacheReplace(op.table, op.match, op.rows || []);
+        (op.rows || []).forEach(x => this.noteWrite(op.table, x));
+      } else if (op.action === 'replaceMany'){
+        (op.items || []).forEach(x => {
+          this.cacheReplace(op.table, x.match, x.rows || []);
+          (x.rows || []).forEach(y => this.noteWrite(op.table, y));
+        });
+      }
+    });
+  },
+
+  /** お試しモードでは、その場で1つずつ書く */
+  runOpsLocal(ops){
+    (ops || []).forEach(op => {
+      if (op.action === 'saveCow') this.local({ action: 'saveCow', row: op.row });
+      else if (op.action === 'saveCowsMany') this.local({ action: 'saveCowsMany', rows: op.rows });
+      else if (op.action === 'replace')
+        this.local({ action: 'replace', table: op.table, match: op.match, rows: op.rows });
+      else if (op.action === 'replaceMany')
+        this.local({ action: 'replaceMany', table: op.table, items: op.items });
+    });
+  },
+
+  /** 待たずに送る（送信箱へ） */
+  batchSoon(ops, label){
+    this.applyOpsLocal(ops);
+    if (!this.isRemote){ this.runOpsLocal(ops); return; }
+    Outbox.add({ action: 'batch', ops }, label);
+  },
+
   /** 何頭ぶんもの個体情報を1回で保存する（部屋の付け替えなど） */
   async saveCowsMany(rows){
     const list = (rows || []).filter(r => r && r.cow_no);
@@ -1843,6 +1897,14 @@ const Outbox = {
         } catch (e){
           const msg = String(e && e.message || e);
           // 古い Code.gs は「まとめて入れ直す」を知らないので、1件ずつに割り直す
+          if (/不明な操作|まとめて送れない/.test(msg) && it.payload.action === 'batch'){
+            const split = (it.payload.ops || []).map(op => ({
+              id: uid(), label: it.label, tries: 0, err: '', payload: op }));
+            this.items.splice(0, 1);
+            if (split.length) this.items.unshift.apply(this.items, split);
+            this.save();
+            continue;
+          }
           if (/不明な操作/.test(msg) && it.payload.action === 'replaceMany'){
             const t = it.payload.table;
             const split = (it.payload.items || []).map(x => ({
@@ -6427,25 +6489,36 @@ function openAwayForm(cow, opts){
         const d = ymd(fDate.value) || today();
         const where = fWhere ? fWhere.value.trim() : '';
         const price = fPrice ? String(num(fPrice.value) ?? '') : '';
-        await Store.saveCow({
-          cow_no: cow.cow_no,
-          status: kind,
-          status_date: d,
-          pen: '',                                   // 部屋からも外す
-          depot: kind === '預託' ? where : (cow.depot || ''),
-          sale_to: kind === '預託' ? (cow.sale_to || '') : where,
-          sale_price: price || (cow.sale_price || ''),
-          sale_note: fNote.value.trim() || (cow.sale_note || '')
-        });
-        await Store.add('events', {
-          cow_no: cow.cow_no, date: d, type: kind,
-          detail: [where, price ? r0(price) + '円' : ''].filter(Boolean).join(' ') || kind,
-          note: fNote.value.trim()
-        });
+        /* 個体情報と出来事の2つを書く必要があります。
+           以前は1つずつ送っていたので2往復＝13秒かかっていました。
+           まとめて1回にし、送信は裏で進めます。 */
+        Store.batchSoon([
+          { action: 'saveCow', row: {
+              cow_no: cow.cow_no,
+              status: kind,
+              status_date: d,
+              pen: '',                                   // 部屋からも外す
+              depot: kind === '預託' ? where : (cow.depot || ''),
+              sale_to: kind === '預託' ? (cow.sale_to || '') : where,
+              sale_price: price || (cow.sale_price || ''),
+              sale_note: fNote.value.trim() || (cow.sale_note || '')
+            } },
+          { action: 'replace', table: 'events',
+            match: { cow_no: cow.cow_no, date: d, type: kind },
+            rows: [{ cow_no: cow.cow_no, date: d, type: kind,
+                     detail: [where, price ? r0(price) + '円' : ''].filter(Boolean).join(' ') || kind,
+                     note: fNote.value.trim() }] }
+        ], cow.tag4 + ' ' + kind);
+
+        // 死んだ牛は、その場で名簿からも外す（次に開いたときも出ません）
+        if (kind === '死亡')
+          Store.cows = Store.cows.filter(c => String(c.cow_no) !== String(cow.cow_no));
+
         MilkBoard.reset(); Analysis.reset();
         close();
         toast(cow.tag4 + ' を' + kind + 'にしました');
-        App.render();
+        if (kind === '死亡' && App.view === 'cow') App.go('search');
+        else App.render();
       });
       body.appendChild(btn);
     };
@@ -6472,11 +6545,14 @@ function openReturnForm(cow){
     const btn = el('button', { class: 'btn primary', style: 'width:100%' }, '牧場に戻す');
     btn.onclick = () => submitting(btn, async () => {
       const d = ymd(fDate.value) || today();
-      await Store.saveCow({ cow_no: cow.cow_no, status: '在籍',
-                            status_date: d, pen: fPen.value });
-      await Store.add('events', {
-        cow_no: cow.cow_no, date: d, type: '帰場',
-        detail: (cow.depot ? cow.depot + ' から' : '') + '牧場へ', note: '' });
+      Store.batchSoon([
+        { action: 'saveCow', row: { cow_no: cow.cow_no, status: '在籍',
+                                    status_date: d, pen: fPen.value } },
+        { action: 'replace', table: 'events',
+          match: { cow_no: cow.cow_no, date: d, type: '帰場' },
+          rows: [{ cow_no: cow.cow_no, date: d, type: '帰場',
+                   detail: (cow.depot ? cow.depot + ' から' : '') + '牧場へ', note: '' }] }
+      ], cow.tag4 + ' 牧場に戻す');
       MilkBoard.reset(); Analysis.reset();
       close(); toast(cow.tag4 + ' を牧場に戻しました'); App.render();
     });
@@ -6670,7 +6746,8 @@ function viewEntry(){
 
   c.appendChild(el('div', { class: 'grid2', style: 'margin-top:12px' },
     tileAction('🌾', 'スターター', '一括入力', () => App.go('bulk_starter')),
-    tileAction('📏', '胸囲・体高', '一括入力', () => App.go('bulk_weight'))));
+    tileAction('📏', '胸囲・体高', '一括入力', () => App.go('bulk_weight')),
+    tileAction('🍼', '出生体重', 'まとめて入力', () => App.go('birthweight'))));
   wrap.appendChild(c);
 
   /* --- ② 申し送り（担当が替わるので、いちばん上のほうに） ----- */
@@ -6768,6 +6845,140 @@ function preweanCows(){
     const d = ageDays(c.birth_date);
     return d != null && d >= 0 && d <= maxD;
   }).sort((a, b) => ageDays(a.birth_date) - ageDays(b.birth_date));
+}
+
+/* ------------------------------------------------------------
+   出生体重をまとめて入れる
+   ------------------------------------------------------------
+   生まれた日に体重計で測って、あとからまとめて入れるための画面です。
+   1頭ずつカルテを開いて入れるのは手間なので、
+   「生年月日を選ぶ → その日に生まれた子の出生体重を並べて入れる」
+   の2手だけで終わるようにしています。
+
+   胸囲や体高は聞きません。出生体重は体重計の実測だけを使います。
+   書き込む先は体重の表で、日付は生まれた日。
+   0日齢の体重は出生体重として扱われるので、これだけでカルテにも出ます。
+   ------------------------------------------------------------ */
+let bwDate = '';          // 空なら「まだ入っていない牛」を出す
+
+function viewBirthWeights(){
+  const wrap = el('div');
+
+  // その牛の出生体重（個体情報か、0日齢の体重から埋まったもの）
+  const bwOf = c => num(c.birth_weight);
+
+  const missing = Store.cows
+    .filter(c => c.birth_date && bwOf(c) == null)
+    .sort((a, b) => String(a.birth_date) < String(b.birth_date) ? 1 : -1);
+
+  const list = bwDate
+    ? Store.cows.filter(c => ymd(c.birth_date) === bwDate)
+        .sort((a, b) => (+a.tag4 || 0) - (+b.tag4 || 0))
+    : missing.slice(0, 80);
+
+  App.setTop('出生体重をまとめて入力',
+    bwDate ? fmtDateFull(bwDate) + ' 生まれ ' + list.length + '頭'
+           : '未入力 ' + missing.length + '頭', true);
+
+  /* --- 生年月日を選ぶ --- */
+  const head = el('div', { class: 'card tight' });
+  const fDate = inp({ type: 'date', value: bwDate,
+                      style: 'max-width:170px;min-height:var(--tap-sm)' });
+  fDate.addEventListener('change', () => { bwDate = ymd(fDate.value) || ''; App.render(); });
+  head.appendChild(el('div', {
+    style: 'display:flex;gap:9px;align-items:center;flex-wrap:wrap;margin-bottom:8px' },
+    el('span', { style: 'font-size:var(--t1);color:var(--ink-2);font-weight:650' }, '生年月日'),
+    fDate,
+    bwDate ? el('button', { class: 'btn sm ghost', style: 'padding:6px 12px',
+      onclick: () => { bwDate = ''; App.render(); } }, '未入力をぜんぶ') : null));
+
+  /* よく使う日付は押すだけで選べるように（最近その日に生まれた子がいる日） */
+  const days = [];
+  missing.forEach(c => { const d = ymd(c.birth_date);
+    if (d && days.indexOf(d) < 0 && days.length < 6) days.push(d); });
+  if (days.length){
+    head.appendChild(el('div', { class: 't-micro',
+      style: 'color:var(--muted);margin-bottom:4px' }, '未入力の子がいる日'));
+    head.appendChild(el('div', { class: 'chips sm' },
+      days.map(d => el('button', { class: 'chip', 'aria-pressed': bwDate === d,
+        onclick: () => { bwDate = d; App.render(); } },
+        fmtDate(d) + '（' + missing.filter(c => ymd(c.birth_date) === d).length + '）'))));
+  }
+  wrap.appendChild(head);
+
+  if (!list.length){
+    wrap.appendChild(el('div', { class: 'empty' },
+      el('div', { class: 'big' }, '🍼'),
+      bwDate ? 'この日に生まれた牛はいません' : '出生体重はぜんぶ入っています'));
+    return wrap;
+  }
+
+  /* --- 一覧 --- */
+  const inputs = [];
+  const card = el('div', { class: 'card' });
+  card.appendChild(el('h2', {}, bwDate ? 'この日に生まれた牛' : '出生体重が未入力の牛',
+    el('span', { class: 'note' }, list.length + '頭')));
+  card.appendChild(el('div', { class: 'hint', style: 'margin-bottom:8px' },
+    '体重計で測った値（kg）を入れてください。空の牛は保存しません。'));
+
+  list.forEach(c => {
+    const cur = num(c.birth_weight);
+    const f = inp({ type: 'number', inputmode: 'decimal', step: '0.1',
+                    style: 'text-align:right',
+                    value: cur != null ? r1(cur) : '',
+                    placeholder: '' });
+    const row = el('div', {
+      style: 'display:flex;align-items:center;gap:10px;padding:9px 0;' +
+             'border-bottom:1px solid var(--grid)' },
+      el('div', { style: 'min-width:58px' },
+        el('div', { style: 'font-size:var(--t4);font-weight:800;line-height:1.15;' +
+                           'font-variant-numeric:tabular-nums' }, c.tag4),
+        el('div', { class: 't-micro', style: 'color:var(--muted)' },
+          isWagyu(c) ? '和牛' : (c.sex || ''))),
+      el('div', { style: 'flex:1;min-width:0;font-size:var(--t1);color:var(--muted);' +
+                         'overflow:hidden;text-overflow:ellipsis;white-space:nowrap' },
+        c.name || (bwDate ? '' : fmtDate(c.birth_date) + '生'),
+        cur != null ? el('span', { class: 'badge good', style: 'margin-left:6px' }, '入力済み') : null),
+      el('div', { style: 'width:112px;display:flex;align-items:center;gap:5px;flex:none' },
+        f, el('span', { style: 'font-size:var(--t1);color:var(--muted)' }, 'kg')));
+    inputs.push({ cow: c, f, was: cur });
+    card.appendChild(row);
+  });
+  wrap.appendChild(card);
+
+  /* --- 保存 --- */
+  wrap.appendChild(el('div', { style: 'height:8px' }));
+  const bar = el('div', { class: 'actionbar' });
+  const btn = el('button', { class: 'btn primary' }, '保存する');
+  btn.onclick = () => submitting(btn, async () => {
+    const items = [];
+    inputs.forEach(x => {
+      const v = num(x.f.value);
+      if (v == null || v <= 0) return;
+      if (x.was != null && Math.abs(v - x.was) < 0.001) return;   // 変えていない牛は送らない
+      const d = ymd(x.cow.birth_date);
+      if (!d) return;
+      items.push({ match: { cow_no: x.cow.cow_no, date: d },
+                   rows: [{ cow_no: x.cow.cow_no, date: d,
+                            chest_cm: '', height_cm: '', weight_actual: r1(v),
+                            weight_est: '', source: '実測',
+                            operator: Store.cfg.user || '', note: '出生時' }] });
+      // 手元の名簿にもすぐ反映（一覧から消えます）
+      const i = Store.cows.findIndex(c => String(c.cow_no) === String(x.cow.cow_no));
+      if (i >= 0) Store.cows[i] = normalizeCow(
+        Object.assign({}, Store.cows[i], { birth_weight: r1(v), bw0: 1 }));
+    });
+    if (!items.length) throw new Error('入力された出生体重がありません');
+    Store.replaceManySoon('weights', items, '出生体重 ' + items.length + '頭');
+    Analysis.reset();
+    toast(items.length + '頭分の出生体重を記録しました');
+    App.render();
+  });
+  bar.appendChild(btn);
+  bar.appendChild(el('div', { class: 'meta' },
+    '入っているものは上書きされます。空の牛は触りません。'));
+  wrap.appendChild(bar);
+  return wrap;
 }
 
 /* --- 一括入力画面 --- */
@@ -7879,6 +8090,54 @@ function viewSettings(){
       'スプレッドシートとの1往復には、どうしても数秒かかります。',
       '記録の保存は待たずに次へ進めるようにしてあるので、この秒数は裏で進みます。'));
     wrap.appendChild(cs);
+  }
+
+  /* --- 死亡した牛 --- */
+  /* 死んだ牛はアプリの名簿から外していますが、記録は消していません。
+     いつでもここから見られて、間違えたときは戻せます。 */
+  if (Store.isRemote){
+    const cd = el('div', { class: 'card' });
+    cd.appendChild(el('h2', {}, '死亡した牛'));
+    cd.appendChild(el('div', { class: 'hint', style: 'margin-bottom:10px' },
+      '死亡にした牛は、毎日の画面に出ないよう名簿から外しています。',
+      'スプレッドシートの記録は消していないので、ここからいつでも見られます。'));
+    const slot = el('div');
+    const btnDead = el('button', { class: 'btn sm ghost', style: 'width:100%' },
+      '死亡にした牛を見る');
+    btnDead.onclick = () => submitting(btnDead, async () => {
+      const d = await Store.call({ action: 'export', table: 'cows' });
+      const dead = (d.rows || []).filter(c => String(c.status || '') === '死亡')
+        .sort((a, b) => String(a.status_date) < String(b.status_date) ? 1 : -1);
+      slot.innerHTML = '';
+      if (!dead.length){
+        slot.appendChild(el('div', { class: 'empty' }, '死亡にした牛はいません'));
+        return;
+      }
+      slot.appendChild(el('div', { class: 't-micro',
+        style: 'color:var(--muted);margin:10px 0 4px' }, dead.length + '頭'));
+      dead.forEach(c => {
+        const back = el('button', { class: 'btn sm ghost', style: 'flex:none;padding:6px 11px' },
+          '戻す');
+        back.onclick = () => submitting(back, async () => {
+          await Store.saveCow({ cow_no: c.cow_no, status: '在籍', status_date: today() });
+          toast(mid4(c.cow_no) + ' を名簿に戻しました');
+          back.remove();
+        });
+        slot.appendChild(el('div', {
+          style: 'display:flex;align-items:center;gap:10px;padding:8px 0;' +
+                 'border-bottom:1px solid var(--grid);font-size:var(--t1)' },
+          el('b', { style: 'min-width:52px;font-variant-numeric:tabular-nums' },
+            c.mgmt_no || mid4(c.cow_no)),
+          el('div', { style: 'flex:1;min-width:0;color:var(--muted);' +
+                             'overflow:hidden;text-overflow:ellipsis;white-space:nowrap' },
+            [c.name, c.status_date ? fmtDate(c.status_date) : '', c.sale_note]
+              .filter(Boolean).join('　')),
+          back));
+      });
+    });
+    cd.appendChild(btnDead);
+    cd.appendChild(slot);
+    wrap.appendChild(cd);
   }
 
   /* --- データ --- */
@@ -9370,6 +9629,7 @@ const MilkBoard = {
   loaded: false,
 
   reset(){ this.loaded = false; this.loading = false; this.savedLoaded = false;
+           this.checked = false; this.fromCache = false;
            this.rows = []; this.date = null; },
 
   /* 群の判定。
@@ -9429,68 +9689,104 @@ const MilkBoard = {
 
   /** その日すでに保存してある値を読み込んで、画面に出しておく。
       入れ直しのときに「何が入っているか」が見えないと直せないため。 */
+  /* ------------------------------------------------------------
+     その日すでに入っている量と、前日の量を入れる
+     ------------------------------------------------------------
+     ここは以前、開くたびにスプレッドシートへ取りに行っていました。
+     哺乳の表が大きくなるほど遅くなり、現場では20秒待つことがありました。
+
+     いまは2段構えです。
+       ① 起動のときにまとめて取ってある手元の控えから、すぐ組み立てる（通信ゼロ）
+       ② そのうえで、他の人がもう入れていないかを裏で確かめて、
+          触っていない牛だけ静かに入れ替える
+
+     ①だけだと、別の端末で入れた分を見落とす恐れがあります。
+     ②を必ず走らせることで、画面はすぐ出るのに取りこぼさない、という形にしています。
+     ------------------------------------------------------------ */
+
+  /** 1頭ぶんの行に、その日の記録をあてはめる */
+  applyDay(r, list){
+    if (!list || !list.length) return false;
+    const per = list.filter(m => /^[0-9]+$/.test(String(m.feeding_no || '').trim()));
+    const use = per.length ? per : list;
+    const am = use.find(m => String(m.feeding_no).trim() === '1');
+    const pm = use.find(m => String(m.feeding_no).trim() === '2');
+    if (per.length){
+      r.am = am ? num(am.volume_l) : null;
+      r.pm = pm ? num(pm.volume_l) : null;
+    } else {
+      // 「1日分」でまとめて入っている行は、回数で割って朝夕に振り分ける
+      const feeds = Calc.perDay() || 2;
+      const total = use.reduce((s, m) => s + (num(m.volume_l, 0) || 0), 0);
+      r.am = r.pm = Math.round(total / feeds * 100) / 100;
+    }
+    const src = use[0] || list[0];
+    r.refused = src.refused || '';
+    r.feces = src.feces || '';
+    r.note = src.note || '';
+    r.saved = true;
+    return true;
+  },
+
+  /** 1頭ぶんの行に、前日の量をあてはめる */
+  applyPrev(r, list, prevDate){
+    if (!list || !list.length) return;
+    const per = list.filter(m => /^[0-9]+$/.test(String(m.feeding_no || '').trim()));
+    r.prevDate = prevDate;
+    if (per.length){
+      const a = per.find(m => String(m.feeding_no).trim() === '1');
+      const p = per.find(m => String(m.feeding_no).trim() === '2');
+      r.prevAm = a ? num(a.volume_l) : null;
+      r.prevPm = p ? num(p.volume_l) : null;
+    } else {
+      const feeds = Calc.perDay() || 2;
+      const total = list.reduce((s, m) => s + (num(m.volume_l, 0) || 0), 0);
+      r.prevAm = r.prevPm = Math.round(total / feeds * 100) / 100;
+    }
+  },
+
+  /** 手元の控え（起動のときにまとめて取ったもの）から組み立てる。通信ゼロ */
+  fillFromCache(){
+    const prevDate = addDays(this.date, -1);
+    let missing = 0;
+    this.rows.forEach(r => {
+      const rec = Store.cache[String(r.cow.cow_no)];
+      if (!rec || !rec.milk_feed){ missing++; return; }
+      const on = ds => rec.milk_feed.filter(m => ymd(m.date) === ds);
+      this.applyPrev(r, on(prevDate), prevDate);
+      this.applyDay(r, on(this.date));
+    });
+    this.prefill();
+    this.fromCache = true;
+    return missing;
+  },
+
+  /** 他の人がもう入れていないかを、裏で確かめる */
   async loadSaved(){
     if (this.loading) return;
     this.loading = true;
     try {
-      // 前日の分も一緒に読む。
-      //   ・前日と同じ量を、開いた時点で入れておくため
-      //   ・「前回よりどれだけ増やしたか」を安全圏の判定に使うため
-      // 2日分をまとめて1回で取ります（1往復ぶん、待ち時間が減ります）。
+      // 前日の分も一緒に、1回で取ります
       const prevDate = addDays(this.date, -1);
       const all = await Store.call({ action: 'export', table: 'milk_feed',
                                      from: prevDate, to: this.date });
-      const onDay = ds => (all.rows || [])
-        .filter(m => String(m.date || '').slice(0, 10) === ds);
-      const d = { rows: onDay(this.date) }, dp = { rows: onDay(prevDate) };
-      const byPrev = {};
-      (dp.rows || []).forEach(m => {
-        (byPrev[String(m.cow_no)] = byPrev[String(m.cow_no)] || []).push(m);
+      const byDay = {}, byPrev = {};
+      (all.rows || []).forEach(m => {
+        const d = ymd(m.date), no = String(m.cow_no);
+        const box = d === this.date ? byDay : (d === prevDate ? byPrev : null);
+        if (box) (box[no] = box[no] || []).push(m);
       });
       this.rows.forEach(r => {
-        const list = byPrev[String(r.cow.cow_no)];
-        if (!list || !list.length) return;
-        const per = list.filter(m => /^[0-9]+$/.test(String(m.feeding_no || '').trim()));
-        r.prevDate = prevDate;
-        if (per.length){
-          const a = per.find(m => String(m.feeding_no).trim() === '1');
-          const p = per.find(m => String(m.feeding_no).trim() === '2');
-          r.prevAm = a ? num(a.volume_l) : null;
-          r.prevPm = p ? num(p.volume_l) : null;
-        } else {
-          const feeds = Calc.perDay() || 2;
-          const total = list.reduce((s, m) => s + (num(m.volume_l, 0) || 0), 0);
-          r.prevAm = r.prevPm = Math.round(total / feeds * 100) / 100;
-        }
-      });
-
-      const by = {};
-      (d.rows || []).forEach(m => {
-        (by[String(m.cow_no)] = by[String(m.cow_no)] || []).push(m);
-      });
-      this.rows.forEach(r => {
-        const list = by[String(r.cow.cow_no)];
-        if (!list || !list.length) return;
-        const per = list.filter(m => /^[0-9]+$/.test(String(m.feeding_no || '').trim()));
-        const use = per.length ? per : list;
-        const am = use.find(m => String(m.feeding_no).trim() === '1');
-        const pm = use.find(m => String(m.feeding_no).trim() === '2');
-        if (per.length){
-          if (am) r.am = num(am.volume_l);
-          if (pm) r.pm = num(pm.volume_l);
-        } else {
-          // 「1日分」でまとめて入っている行は、回数で割って朝夕に振り分ける
-          const feeds = Calc.perDay() || 2;
-          const total = use.reduce((s, m) => s + (num(m.volume_l, 0) || 0), 0);
-          r.am = r.pm = Math.round(total / feeds * 100) / 100;
-        }
-        const src = use[0] || list[0];
-        r.refused = src.refused || '';
-        r.feces = src.feces || '';
-        r.note = src.note || '';
-        r.saved = true;
+        const no = String(r.cow.cow_no);
+        this.applyPrev(r, byPrev[no], prevDate);
+        // 人がさわった牛は、上書きしない（入力中の値を消さないため）
+        if (r.changed || r.confirmed) return;
+        r.saved = false; r.am = null; r.pm = null;
+        r.refused = ''; r.feces = ''; r.note = '';
+        this.applyDay(r, byDay[no]);
       });
       this.prefill();
+      this.checked = true;
     } finally { this.loading = false; }
   },
 
@@ -9579,8 +9875,12 @@ const MilkBoard = {
 };
 
 function viewMilkBoard(){
-  if (!MilkBoard.loaded) MilkBoard.build();
-  // その日すでに保存してある値を後から流し込む（読めたら描き直す）
+  if (!MilkBoard.loaded){
+    MilkBoard.build();
+    // まず手元の控えから組み立てる（通信ゼロ。開いた瞬間に使えます）
+    MilkBoard.fillFromCache();
+  }
+  // そのうえで、他の人がもう入れていないかを裏で確かめる
   if (!MilkBoard.savedLoaded && !MilkBoard.loading){
     MilkBoard.savedLoaded = true;
     MilkBoard.loadSaved()
@@ -9623,10 +9923,7 @@ function viewMilkBoard(){
     (r.confirmed || r.changed) &&
     ((num(r.am, 0) || 0) + (num(r.pm, 0) || 0)) > 0).length;
 
-  if (MilkBoard.loading){
-    head.appendChild(el('button', { class: 'btn', disabled: true },
-      el('span', { class: 'spinner sm' }), ' 前日の量を読んでいます…'));
-  } else if (pend.length){
+  if (pend.length){
     head.appendChild(el('button', { class: 'btn primary',
       onclick: () => { MilkBoard.confirmAll(); App.render(); } },
       '✓ 全部このままでOK（' + pend.length + '頭）'));
@@ -9634,6 +9931,10 @@ function viewMilkBoard(){
       style: 'margin-top:6px;color:var(--muted);line-height:1.5' },
       '前日と同じ量が入っています。違う牛だけ、その行を開いて ± で直してください。',
       el('br'), '朝 ' + S['routine.am_milk'] + ' ／ 夕 ' + S['routine.pm_milk']));
+    if (MilkBoard.loading)
+      head.appendChild(el('div', { class: 't-micro',
+        style: 'margin-top:5px;color:var(--muted)' },
+        el('span', { class: 'spinner sm' }), ' ほかの人がもう入れていないか確かめています…'));
   } else {
     head.appendChild(el('div', { class: 'note',
       style: 'margin:0;background:color-mix(in srgb,var(--good) 10%,transparent)' },
@@ -10829,11 +11130,14 @@ async function moveCow(cow, toName, opts){
   const to = String(toName || '').trim();
   if (from === to){ App.render(); return; }
   try {
-    await Store.saveCow({ cow_no: cow.cow_no, pen: to });
-    await Store.add('events', {
-      cow_no: cow.cow_no, date: today(), type: '移動',
-      detail: (from || '部屋なし') + ' → ' + (to || '部屋なし'), note: ''
-    });
+    // 部屋の付け替えと、その記録。まとめて1回で送り、待たずに画面を進める。
+    Store.batchSoon([
+      { action: 'saveCow', row: { cow_no: cow.cow_no, pen: to } },
+      { action: 'replace', table: 'events',
+        match: { cow_no: cow.cow_no, date: today(), type: '移動' },
+        rows: [{ cow_no: cow.cow_no, date: today(), type: '移動',
+                 detail: (from || '部屋なし') + ' → ' + (to || '部屋なし'), note: '' }] }
+    ], cow.tag4 + ' 移動 → ' + (to || '部屋なし'));
     MilkBoard.reset();
     PenView.moved = opts.undo ? null : { cow_no: cow.cow_no, from, to };
     toast(cow.tag4 + ' → ' + (to || '部屋なし'));
@@ -11503,6 +11807,10 @@ App.render = function(){
     customView('entry').appendChild(viewMilkBoard());
     return;
   }
+  if (this.view === 'birthweight'){
+    customView('entry').appendChild(viewBirthWeights());
+    return;
+  }
   if (this.view === 'bulk_milk' || this.view === 'bulk_starter' || this.view === 'bulk_weight'){
     customView('entry').appendChild(viewBulk(this.view.replace('bulk_', '')));
     return;
@@ -11574,7 +11882,8 @@ $('#btnBack').onclick = () => {
   else if (App.view === 'import') App.go('settings');
   else if (App.view === 'analysis') App.go('herd');
   else if (App.view === 'pens') App.go('herd');
-  else if (String(App.view).startsWith('bulk_') || App.view === 'milkboard') App.go('entry');
+  else if (String(App.view).startsWith('bulk_') || App.view === 'milkboard' ||
+           App.view === 'birthweight') App.go('entry');
   else App.go('search');
 };
 
