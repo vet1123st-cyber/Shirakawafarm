@@ -399,6 +399,23 @@ figure.chart figcaption{font-size:var(--t1);color:var(--muted);margin-top:8px;li
 }
 .toast.err{background:var(--crit);color:#fff}
 
+/* 送信箱の帯。まだ送れていない記録があるあいだ、ずっと出しておく。
+   だまって消えないことが、現場で信用してもらえる唯一の条件なので。 */
+.outbox{
+  position:fixed;left:8px;right:8px;bottom:calc(68px + env(safe-area-inset-bottom));
+  z-index:150;border-radius:12px;padding:9px 12px;
+  display:flex;align-items:center;gap:10px;
+  font-size:var(--t1);font-weight:650;box-shadow:var(--shadow);
+  background:var(--ink);color:var(--page)
+}
+.outbox.bad{background:var(--crit);color:#fff}
+.outbox .msg{flex:1;min-width:0;line-height:1.4}
+.outbox button{
+  flex:none;border:0;border-radius:9px;padding:7px 12px;min-height:var(--tap-sm);
+  font-size:var(--t0);font-weight:700;cursor:pointer;
+  background:rgba(255,255,255,.22);color:inherit
+}
+
 .note{
   border-radius:var(--r-sm);padding:13px 14px;font-size:var(--t1);line-height:1.65;
   background:var(--surface-2);color:var(--ink-2);margin-bottom:13px
@@ -475,6 +492,8 @@ hr.sep{border:0;border-top:1px solid var(--grid);margin:16px 0}
 </div>
 
 <main class="app" id="main"></main>
+
+<div class="outbox" id="outbox" hidden></div>
 
 <nav class="nav">
   <button data-nav="search"><span class="ic">🔍</span>検索</button>
@@ -886,14 +905,19 @@ const EVENT_TYPES = ['増乳開始','ピーク到達','減乳開始','離乳','�
  *               表や列が増えたときだけ上げる。上げたら Code.gs のデプロイも必要。
  * BUILD_ID     … この index.html を作った日時。作るたびに毎回変わる。
  *               「新しい画面が出ていないか」を見るためだけに使う。
- *               build.sh が 2026-09-10-0504 を実際の日時に置き換えます。
+ *               build.sh が 2026-09-11-0416 を実際の日時に置き換えます。
  */
 /* カルテを開いた瞬間に要る表と、タブを開いたときでいい表 */
 const COW_CORE_TABLES = ['weights', 'milk_feed', 'starter', 'repro', 'events', 'colostrum'];
 const COW_LAZY_TABLES = ['genomics', 'milk_test'];
 
 const APP_VERSION = '2026-09-10a';
-const BUILD_ID = '2026-09-10-0504';
+/* 起動を待たせないための「前回の内容」の形。
+   受け取る中身の作りを変えたときだけ、ここを上げます。
+   以前は BUILD_ID を目印にしていたので、画面を1文字直して作り直すたびに
+   全員の控えが捨てられ、更新した日の朝だけ待たされていました。 */
+const DATA_SHAPE = '3';
+const BUILD_ID = '2026-09-11-0416';
 const REQUIRED_TABLES = ['cows', 'weights', 'milk_feed', 'starter', 'repro', 'events',
                          'genomics', 'milk_test', 'colostrum', 'pens', 'daily_check',
                          'milk_plan', 'settings'];
@@ -951,7 +975,24 @@ const Store = {
     }
   },
 
+  /* 何にどれだけかかったかを、直近だけ覚えておく。
+     現場から「遅い」と言われたときに、当てずっぽうで直さないため。 */
+  timings: [],
+  noteTiming(action, ms){
+    this.timings.unshift({ action, ms: Math.round(ms), at: new Date().toISOString() });
+    if (this.timings.length > 20) this.timings.length = 20;
+  },
+
   async callOnce(payload){
+    const t0 = (typeof performance !== 'undefined' ? performance.now() : Date.now());
+    try { return await this.callRaw(payload); }
+    finally {
+      const t1 = (typeof performance !== 'undefined' ? performance.now() : Date.now());
+      this.noteTiming(payload.action, t1 - t0);
+    }
+  },
+
+  async callRaw(payload){
     const url = this.cfg.url;
     const body = Object.assign({ token: this.cfg.token, user: this.cfg.user }, payload);
     let res, txt;
@@ -1235,7 +1276,7 @@ const Store = {
      ・接続先（URL）が違うときや、画面の版が変わったときは使いません
      ・localStorage が使えない端末では、今までどおり待つだけです
      ------------------------------------------------------------ */
-  cacheKey(){ return 'sw.init.' + BUILD_ID + '.' + (this.cfg.url || 'local'); },
+  cacheKey(){ return 'sw.init.' + DATA_SHAPE + '.' + (this.cfg.url || 'local'); },
 
   /** 前回の内容を保存しておく（大きすぎるときはあきらめる） */
   saveInitCache(d){
@@ -1701,6 +1742,35 @@ const Store = {
     }
   },
 
+  /* ------------------------------------------------------------
+     待たずに保存する
+     ------------------------------------------------------------
+     先に手元の控えを直してから、送信は送信箱にあずけます。
+     画面はすぐ次へ進み、送信は裏で続きます。
+     ------------------------------------------------------------ */
+  replaceSoon(table, match, rows, label){
+    this.cacheReplace(table, match, rows);
+    (rows || []).forEach(x => this.noteWrite(table, x));
+    if (!this.isRemote) return this.local({ action: 'replace', table, match, rows });
+    Outbox.add({ action: 'replace', table, match, rows }, label);
+  },
+
+  replaceManySoon(table, items, label){
+    const list = (items || []).filter(x => x && x.match);
+    if (!list.length) return;
+    list.forEach(x => {
+      this.cacheReplace(table, x.match, x.rows || []);
+      (x.rows || []).forEach(y => this.noteWrite(table, y));
+    });
+    if (!this.isRemote){
+      list.forEach(x => this.local({ action: 'replace', table, match: x.match, rows: x.rows || [] }));
+      return;
+    }
+    Outbox.add(list.length === 1
+      ? { action: 'replace', table, match: list[0].match, rows: list[0].rows || [] }
+      : { action: 'replaceMany', table, items: list }, label);
+  },
+
   async bulk(table, rows, dedupe){
     const r = await this.call({ action: 'bulk', table, rows, dedupe: dedupe || null });
     // 取り込みは行数が多く、どの行がどうなったかを手元で追えないので、
@@ -1712,6 +1782,100 @@ const Store = {
     else this.cache = {};
     (rows || []).forEach(x => this.noteWrite(table, x));
     return r;
+  }
+};
+
+/* ------------------------------------------------------------
+   送信箱 — 保存を待たずに、次の牛へ行けるようにする
+   ------------------------------------------------------------
+   スプレッドシートに1回送るのに、どうしても5〜7秒かかります。
+   1頭ごとに待っていると、30頭で3分以上その場に立つことになります。
+
+   そこで、押した瞬間に手元の控えを直して画面を進め、
+   送信は裏で続けます。
+
+   いちばん大事なのは「取りこぼさないこと」なので、
+     ・送るものは端末に書き出しておく（アプリを閉じても消えない）
+     ・送れるまで消さない。電波が戻ったら自動で送り直す
+     ・送れていないあいだは、画面の上に出したままにする
+   としています。だまって消えることはありません。
+
+   入れるのは「何度送っても結果が変わらない操作」だけです。
+   1行足すだけの操作（append）は、送り直すと二重になるので入れません。
+   ------------------------------------------------------------ */
+const Outbox = {
+  items: [],          // { id, payload, label, tries, err }
+  sending: false,
+  onChange: null,     // 中身が変わったら画面に知らせる
+
+  load(){
+    this.items = LS.get('sw.outbox', []) || [];
+    return this.items;
+  },
+  save(){
+    LS.set('sw.outbox', this.items);
+    if (this.onChange) this.onChange();
+  },
+
+  /** 送るものを預ける。手元の控えは、呼ぶ側が先に直しておくこと */
+  add(payload, label){
+    this.items.push({ id: uid(), payload, label: label || '', tries: 0, err: '' });
+    this.save();
+    this.flush();
+  },
+
+  count(){ return this.items.length; },
+  failed(){ return this.items.filter(x => x.err).length; },
+
+  /** たまっているものを、前から順に送る */
+  async flush(){
+    if (this.sending || !this.items.length) return;
+    if (!Store.isRemote){ this.items = []; this.save(); return; }
+    this.sending = true;
+    try {
+      while (this.items.length){
+        const it = this.items[0];
+        try {
+          await Store.call(it.payload);
+          this.items.shift();
+          it.err = '';
+          this.save();
+        } catch (e){
+          const msg = String(e && e.message || e);
+          // 古い Code.gs は「まとめて入れ直す」を知らないので、1件ずつに割り直す
+          if (/不明な操作/.test(msg) && it.payload.action === 'replaceMany'){
+            const t = it.payload.table;
+            const split = (it.payload.items || []).map(x => ({
+              id: uid(), label: it.label, tries: 0, err: '',
+              payload: { action: 'replace', table: t, match: x.match, rows: x.rows || [] }
+            }));
+            this.items.splice(0, 1);
+            if (split.length) this.items.unshift.apply(this.items, split);
+            this.save();
+            continue;
+          }
+          it.tries++;
+          it.err = msg;
+          this.save();
+          break;                  // 電波が戻るまで、ここで止めて待つ
+        }
+      }
+    } finally {
+      this.sending = false;
+    }
+  },
+
+  /** もう一度送る（赤い帯のボタンから） */
+  async retry(){
+    this.items.forEach(x => { x.err = ''; });
+    this.save();
+    await this.flush();
+  },
+
+  /** どうしても送れないものを捨てる（中身を見せたうえで、人が決めたときだけ） */
+  drop(id){
+    this.items = this.items.filter(x => String(x.id) !== String(id));
+    this.save();
   }
 };
 
@@ -4102,6 +4266,57 @@ function appUpdateNote(){
   return c;
 }
 
+/* ------------------------------------------------------------
+   送信箱の帯
+   ------------------------------------------------------------
+   まだ送れていない記録があるあいだ、画面の下に出しっぱなしにします。
+   送れたら黙って消えます。送れないときは赤くして、押せば送り直せます。
+   ------------------------------------------------------------ */
+function paintOutbox(){
+  const bar = $('#outbox');
+  if (!bar) return;
+  const n = Outbox.count();
+  if (!n){ bar.hidden = true; bar.innerHTML = ''; return; }
+  const bad = Outbox.failed() > 0;
+  bar.hidden = false;
+  bar.className = 'outbox' + (bad ? ' bad' : '');
+  bar.innerHTML = '';
+  if (!bad) bar.appendChild(el('span', { class: 'spinner sm' }));
+  bar.appendChild(el('div', { class: 'msg' },
+    bad ? n + '件が送れていません（電波が届いていないかも）'
+        : '保存中… ' + n + '件'));
+  bar.appendChild(el('button', {
+    onclick: () => (bad ? Outbox.retry() : openOutboxSheet())
+  }, bad ? 'もう一度送る' : '中身'));
+}
+
+/** 何が残っているかを、その場で見られるように */
+function openOutboxSheet(){
+  sheet('まだ送れていない記録', (b, close) => {
+    const list = Outbox.items.slice();
+    if (!list.length){
+      b.appendChild(el('div', { class: 'empty' }, 'ぜんぶ送れました'));
+    } else {
+      b.appendChild(el('div', { class: 'note' },
+        '記録は端末に残してあります。アプリを閉じても消えません。',
+        el('br'), '電波が戻れば自動で送ります。'));
+      list.forEach(x => {
+        b.appendChild(el('div', {
+          style: 'border-bottom:1px solid var(--grid);padding:9px 0;font-size:var(--t1)' },
+          el('div', { style: 'font-weight:650' }, x.label || x.payload.action),
+          x.err ? el('div', { style: 'color:var(--crit);font-size:var(--t0);margin-top:3px' },
+            x.err) : null,
+          x.tries ? el('div', { class: 't-micro', style: 'color:var(--muted)' },
+            x.tries + '回ためしました') : null));
+      });
+      b.appendChild(el('button', { class: 'btn primary', style: 'margin-top:14px',
+        onclick: () => { Outbox.retry(); close(); } }, 'いま送ってみる'));
+    }
+    b.appendChild(el('button', { class: 'btn ghost', style: 'margin-top:8px', onclick: close },
+      '閉じる'));
+  }, { focus: false });
+}
+
 function backendUpdateNote(){
   if (!needsBackendUpdate()) return null;
   const names = Store.missingTables.map(t => TABLE_LABEL[t] || t);
@@ -5721,12 +5936,13 @@ function openWeightForm(cow){
     btn.onclick = () => submitting(btn, async () => {
       if (!fChest.value && !fW.value) throw new Error('胸囲か体重のどちらかを入れてください');
       const est = Calc.estWeight(fChest.value);
-      await Store.replace('weights', { cow_no: cow.cow_no, date: fDate.value }, [{
+      // 送信は裏で。押した瞬間に画面が進み、次の牛へ行けます。
+      Store.replaceSoon('weights', { cow_no: cow.cow_no, date: fDate.value }, [{
         cow_no: cow.cow_no, date: fDate.value,
         chest_cm: fChest.value, height_cm: fH.value, weight_actual: fW.value,
         weight_est: est != null ? r1(est) : '',
         source: fW.value ? '実測' : '胸囲', operator: fOp.value.trim(), note: fNote.value.trim()
-      }]);
+      }], cow.tag4 + ' 体重 ' + fmtDate(fDate.value));
       Analysis.reset();
       Store.saveCfg({ user: fOp.value.trim() });
       close(); toast('記録しました'); App.render();
@@ -5793,9 +6009,10 @@ function openMilkForm(cow){
         powder_g_per_l: fType.value === '代用乳' ? fG.value : '',
         note: fNote.value.trim()
       };
-      // 同じ牛・同じ日・同じ回の記録は入れ直す（訂正できるように）
-      await Store.replace('milk_feed',
-        { cow_no: cow.cow_no, date: fDate.value, feeding_no: fNo.value }, [row]);
+      // 同じ牛・同じ日・同じ回の記録は入れ直す（訂正できるように）。送信は裏で。
+      Store.replaceSoon('milk_feed',
+        { cow_no: cow.cow_no, date: fDate.value, feeding_no: fNo.value }, [row],
+        cow.tag4 + ' 哺乳 ' + fmtDate(fDate.value));
       Analysis.reset(); MilkBoard.reset();
     };
     const btn = el('button', { class: 'btn primary' }, '記録する');
@@ -5846,10 +6063,10 @@ function openStarterForm(cow){
         const o = num(fOff.value); if (o == null) throw new Error('給与量か摂取量を入れてください');
         kg = Math.max(0, o - (num(fRef.value, 0) || 0));
       }
-      await Store.replace('starter', { cow_no: cow.cow_no, date: fDate.value }, [{
+      Store.replaceSoon('starter', { cow_no: cow.cow_no, date: fDate.value }, [{
         cow_no: cow.cow_no, date: fDate.value, offered_kg: fOff.value,
         refused_kg: fRef.value, intake_kg: r2(kg), note: fNote.value.trim()
-      }]);
+      }], cow.tag4 + ' スターター ' + fmtDate(fDate.value));
       close(); toast('記録しました'); App.render();
     });
     b.appendChild(btn);
@@ -6073,10 +6290,10 @@ function openColostrumForm(cow, row){
         serum_tp: '', serum_brix: '',
         operator: Store.cfg.user || '', note: fNote.value.trim()
       };
-      // 同じ日の同じ回次は入れ直す（二度押しても増えません）
-      await Store.replace('colostrum',
-        { cow_no: cow.cow_no, date: fDate.value, kind: '給与', feeding_no: fNo.value }, [rec]);
-      Store.invalidate(cow.cow_no);
+      // 同じ日の同じ回次は入れ直す（二度押しても増えません）。送信は裏で。
+      Store.replaceSoon('colostrum',
+        { cow_no: cow.cow_no, date: fDate.value, kind: '給与', feeding_no: fNo.value }, [rec],
+        cow.tag4 + ' 初乳 ' + fNo.value + '回目');
       close(); toast('初乳を記録しました'); App.render();
     });
     b.appendChild(btn);
@@ -6672,11 +6889,11 @@ function viewBulk(kind){
     const table = kind === 'milk' ? 'milk_feed' : kind === 'starter' ? 'starter' : 'weights';
     // 牛ごとに「その日の記録」を入れ直す。二度押しても増えず、直した値が残ります。
     // 以前は1頭ずつ順に送っていて、頭数ぶん待たされていました。まとめて1回で送ります。
-    btn.innerHTML = '';
-    btn.appendChild(el('span', { class: 'spinner' }));
-    btn.appendChild(document.createTextNode(' 保存中… ' + rows.length + '頭'));
-    await Store.replaceMany(table,
-      rows.map(row => ({ match: { cow_no: row.cow_no, date: row.date }, rows: [row] })));
+    // 送信は裏で。押した瞬間に画面が進みます（下の帯で送信中と分かります）
+    Store.replaceManySoon(table,
+      rows.map(row => ({ match: { cow_no: row.cow_no, date: row.date }, rows: [row] })),
+      (kind === 'milk' ? '哺乳' : kind === 'starter' ? 'スターター' : '体重') +
+      ' ' + rows.length + '頭 ' + fmtDate(fDate.value));
     Analysis.reset(); MilkBoard.reset();
     toast(rows.length + '頭分 保存しました');
     App.go('entry');
@@ -7627,6 +7844,42 @@ function viewSettings(){
     el('b', {}, '育成期の牛は一度スケールで実測して照合すること'), 'をおすすめします。',
     'ズレが確認できたら、育成期用の係数をこちらで作り直せます。'));
   wrap.appendChild(c6);
+
+  /* --- 速さの記録 --- */
+  /* 「遅い」と言われたときに、当てずっぽうで直さないための欄です。
+     起動のどこで待っているのか（画面が出るまでか、最新に入れ替わるまでか）と、
+     直近の操作が何秒かかったかを、その場で見られるようにしてあります。 */
+  if (Store.isRemote){
+    const cs = el('div', { class: 'card' });
+    cs.appendChild(el('h2', {}, '速さの記録'));
+    const line = (k, v, note) => el('div', {
+      style: 'display:flex;gap:10px;align-items:baseline;padding:4px 0;font-size:var(--t1)' },
+      el('span', { style: 'color:var(--muted);min-width:132px;flex:none' }, k),
+      el('b', { style: 'font-variant-numeric:tabular-nums' }, v),
+      note ? el('span', { class: 't-micro', style: 'color:var(--muted)' }, note) : null);
+    const sec = ms => ms == null ? '—' : (ms / 1000).toFixed(1) + ' 秒';
+    cs.appendChild(line('画面が出るまで', sec(Boot.painted),
+      Boot.fromCache ? '前回の内容から' : '最初から読んだ'));
+    cs.appendChild(line('最新に入れ替わるまで', sec(Boot.fresh)));
+    cs.appendChild(el('hr', { class: 'sep' }));
+    cs.appendChild(el('div', { class: 't-micro',
+      style: 'color:var(--muted);font-weight:700;margin-bottom:5px' }, '直近のやりとり'));
+    const ts = (Store.timings || []).slice(0, 8);
+    if (!ts.length){
+      cs.appendChild(el('div', { class: 'hint' }, 'まだありません'));
+    } else {
+      const NAME = { init: '起動の読み込み', cow: 'カルテを開く', cowsBulk: 'まとめて先読み',
+                     replace: '記録の保存', replaceMany: 'まとめて保存', saveCow: '個体情報の保存',
+                     saveCowsMany: '個体をまとめて保存', export: '記録の取り出し',
+                     benchmark: '牧場の集計', counts: '件数を数える', bulk: '取り込み' };
+      ts.forEach(t => cs.appendChild(line(NAME[t.action] || t.action, sec(t.ms),
+        fmtWhen(t.at))));
+    }
+    cs.appendChild(el('div', { class: 'hint', style: 'margin-top:8px' },
+      'スプレッドシートとの1往復には、どうしても数秒かかります。',
+      '記録の保存は待たずに次へ進めるようにしてあるので、この秒数は裏で進みます。'));
+    wrap.appendChild(cs);
+  }
 
   /* --- データ --- */
   const c7 = el('div', { class: 'card' });
@@ -9525,11 +9778,10 @@ function viewMilkBoard(){
     }
 
     if (saved){
-      btn.innerHTML = '';
-      btn.appendChild(el('span', { class: 'spinner' }));
-      btn.appendChild(document.createTextNode(' 保存中… ' + cows + '頭'));
-      await Store.replaceMany('milk_feed', feedItems);
-      if (eventItems.length) await Store.replaceMany('events', eventItems);
+      // 送信は裏で。押した瞬間に画面が進みます（下の帯で送信中と分かります）
+      Store.replaceManySoon('milk_feed', feedItems, '哺乳 ' + cows + '頭 ' + fmtDate(MilkBoard.date));
+      if (eventItems.length)
+        Store.replaceManySoon('events', eventItems, '便の記録 ' + eventItems.length + '頭');
     }
     if (!saved){
       const done = MilkBoard.rows.filter(r => r.saved).length;
@@ -11382,6 +11634,30 @@ const Updater = {
 };
 
 /* 起動処理 */
+/* 送信箱を動かしはじめる。
+   前に送りきれなかったものがあれば、ここで送り直します。 */
+Outbox.load();
+Outbox.onChange = paintOutbox;
+paintOutbox();
+window.addEventListener('online', () => Outbox.flush());
+setInterval(() => { if (Outbox.count()) Outbox.flush(); }, 20000);
+window.addEventListener('beforeunload', e => {
+  if (!Outbox.count()) return;
+  e.preventDefault(); e.returnValue = '';      // まだ送れていない記録があります
+});
+
+/* 起動にかかった時間を覚えておく（設定画面に出します）。
+   「朝が遅い」の中身が、画面が出るまでなのか、最新に入れ替わるまでなのかを
+   その場で見分けられるようにするためです。 */
+const Boot = {
+  t0: (typeof performance !== 'undefined' && performance.timing
+        ? 0 : 0),
+  painted: null,      // 前回の内容が出るまで（ms）
+  fresh: null,        // 最新に入れ替わるまで（ms）
+  fromCache: false,
+  now(){ return (typeof performance !== 'undefined' ? performance.now() : Date.now()); }
+};
+
 (async function boot(){
   App.render();
 
@@ -11393,6 +11669,7 @@ const Updater = {
     Analysis.reset(); MilkBoard.reset();
     App.ready = true;
     App.render();
+    Boot.painted = Boot.now(); Boot.fromCache = true;
   }
 
   // 新しい版が出ていないかの確認。待たない（新しければ、この中で読み直しが走る）
@@ -11404,7 +11681,10 @@ const Updater = {
     MilkBoard.reset();
     App.ready = true;
     App.render();
+    Boot.fresh = Boot.now();
+    if (Boot.painted == null) Boot.painted = Boot.fresh;
     if (!Store.isRemote && !Store.cows.length) showWelcome();
+    Outbox.flush();                 // 前に送りきれなかったぶんを、まず送る
     // 牧場ぜんぶの集計（発育曲線・パーセンタイル）は、画面が出たあとに取りに行く
     Store.ensureBenchmark().then(bm => { if (bm) App.render(); }).catch(() => {});
     // 画面が出たあと、裏でよく開く牛のぶんを取っておく
