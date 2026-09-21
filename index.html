@@ -905,19 +905,74 @@ const EVENT_TYPES = ['増乳開始','ピーク到達','減乳開始','離乳','�
  *               表や列が増えたときだけ上げる。上げたら Code.gs のデプロイも必要。
  * BUILD_ID     … この index.html を作った日時。作るたびに毎回変わる。
  *               「新しい画面が出ていないか」を見るためだけに使う。
- *               build.sh が 2026-09-11-0510 を実際の日時に置き換えます。
+ *               build.sh が 2026-09-21-0631 を実際の日時に置き換えます。
  */
 /* カルテを開いた瞬間に要る表と、タブを開いたときでいい表 */
 const COW_CORE_TABLES = ['weights', 'milk_feed', 'starter', 'repro', 'events', 'colostrum'];
 const COW_LAZY_TABLES = ['genomics', 'milk_test'];
 
-const APP_VERSION = '2026-09-10a';
+/* ------------------------------------------------------------
+   ゲノムの形質名を揃える
+   ------------------------------------------------------------
+   2026-09 のゲノム表から、TPI が「IPI正式表示」と書かれるようになりました。
+   値の幅（2500〜2900）も列の並びも TPI と同じで、書き出し側の表記ゆれです。
+   別の形質として貯まると、TPI の履歴と牧場の中央値がその月で途切れるので、
+   **入れるときも読むときも TPI に揃えます。**
+   読むときにも揃えるのは、古い版のアプリで「IPI」として入れてしまった記録が
+   もう表にあっても、画面では TPI として見えるようにするためです。
+   （スプレッドシートに残っている文字はそのままですが、見え方は揃います） */
+const TRAIT_ALIAS = { IPI: 'TPI' };
+function traitName(h){
+  const name = String(h || '').trim().replace(/正式表示$/, '');
+  return TRAIT_ALIAS[name] || name;
+}
+
+/** 手元にしまう前の直し。いまはゲノムの形質名だけ */
+function fixRows(table, rows){
+  if (table !== 'genomics' || !rows || !rows.length) return rows;
+  const seen = {};
+  const out = [];
+  rows.forEach(r => {
+    const t = traitName(r.trait);
+    /* 同じ牛・同じ対象・同じ形質・同じ検査日は1つだけにします。
+       古い版で IPI として入れたあとに TPI で入れ直すと、
+       名前を揃えた結果まったく同じ行が2つ並んでしまうためです。 */
+    const k = String(r.subject || '自身') + '|' + t + '|' + String(r.tested_at || '');
+    if (seen[k]) return;
+    seen[k] = 1;
+    if (t !== r.trait) TRAIT_FIX = true;   // 表の中はまだ古い名前
+    out.push(t === r.trait ? r : Object.assign({}, r, { trait: t }));
+  });
+  return out;
+}
+
+/* 表の中に古い名前が残っていると分かったら立てる目印。
+   設定に「形質の名前を揃える」ボタンを出すかどうかに使う */
+let TRAIT_FIX = false;
+
+/** 牧場全体の集計のほうも揃える（古い Code.gs は IPI のまま返してくるため） */
+function fixBenchmark(bm){
+  const g = bm && bm.genomics;
+  if (!g) return bm;
+  for (const from in TRAIT_ALIAS){
+    const to = TRAIT_ALIAS[from];
+    if (!g[from]) continue;
+    // TPI が無いときだけ置き換える。両方あるなら TPI のほうが新しい
+    if (!g[to]) g[to] = g[from];
+    delete g[from];
+    // 表の中がまだ古い名前だと分かったので、設定に直すボタンを出す
+    TRAIT_FIX = true;
+  }
+  return bm;
+}
+
+const APP_VERSION = '2026-09-21a';
 /* 起動を待たせないための「前回の内容」の形。
    受け取る中身の作りを変えたときだけ、ここを上げます。
    以前は BUILD_ID を目印にしていたので、画面を1文字直して作り直すたびに
    全員の控えが捨てられ、更新した日の朝だけ待たされていました。 */
 const DATA_SHAPE = '3';
-const BUILD_ID = '2026-09-11-0510';
+const BUILD_ID = '2026-09-21-0631';
 const REQUIRED_TABLES = ['cows', 'weights', 'milk_feed', 'starter', 'repro', 'events',
                          'genomics', 'milk_test', 'colostrum', 'pens', 'daily_check',
                          'milk_plan', 'settings'];
@@ -1194,6 +1249,15 @@ const Store = {
         this.runOpsLocal(p.ops);
         return { results: [] };
       }
+      case 'fixTraits': {
+        let fixed = 0;
+        (db.genomics || []).forEach(r => {
+          const n = traitName(r.trait);
+          if (n !== r.trait){ r.trait = n; fixed++; }
+        });
+        this.saveLocal();
+        return { fixed, checked: (db.genomics || []).length };
+      }
       case 'saveCowsMany': {
         const out = (p.rows || []).map(row => {
           const i = db.cows.findIndex(c => String(c.cow_no) === String(row.cow_no));
@@ -1312,7 +1376,7 @@ const Store = {
     this.settings = Object.assign({}, DEFAULTS, d.settings || {});
     // 集計は起動では来ないことがある（画面が出たあとに裏で取りに行きます）。
     // 前回のぶんを持っているなら、それを消さずに残します。
-    this.benchmark = d.benchmark || this.benchmark || null;
+    this.benchmark = fixBenchmark(d.benchmark) || this.benchmark || null;
     // counts（各表の件数）は起動では受け取りません。Store.counts() で必要なときに数えます。
     // 直近のイベントを牛ごとに引けるようにしておく
     this.recentEvents = {};
@@ -1390,7 +1454,7 @@ const Store = {
     try {
       const bm = await this.call({ action: 'benchmark' });
       if (bm && Object.keys(bm).length){
-        this.benchmark = bm;
+        this.benchmark = fixBenchmark(bm);
         this.patchInitCache({ benchmark: bm });   // 次に開いたときはすぐ出る
       }
     } catch (e){ /* 古いバックエンドでは、ただ出ないだけ */ }
@@ -1450,7 +1514,7 @@ const Store = {
     const rec = have || {};
     // 返ってきたものは全部しまう（古いバックエンドは頼んでいない表も返してくる）
     Object.keys(d).forEach(t => {
-      rec[t] = (d[t] || []).slice().sort((a,b) => String(a.date) < String(b.date) ? -1 : 1);
+      rec[t] = fixRows(t, (d[t] || []).slice().sort((a,b) => String(a.date) < String(b.date) ? -1 : 1));
     });
     missing.forEach(t => { if (!rec[t]) rec[t] = []; });
     this.cache[key] = rec;
@@ -1480,8 +1544,8 @@ const Store = {
     Object.keys(d || {}).forEach(no => {
       const rec = this.cache[no] || {};
       Object.keys(d[no] || {}).forEach(t => {
-        rec[t] = (d[no][t] || []).slice()
-          .sort((a, b) => String(a.date) < String(b.date) ? -1 : 1);
+        rec[t] = fixRows(t, (d[no][t] || []).slice()
+          .sort((a, b) => String(a.date) < String(b.date) ? -1 : 1));
       });
       this.cache[no] = rec; n++;
     });
@@ -2233,10 +2297,16 @@ function feedOutcomeLocal(db, S, byNo){
 
 function genomicsHerdLocal(db){
   const by = {};
+  const seen = {};
   (db.genomics || []).forEach(r => {
     if (String(r.subject || '自身') !== '自身') return;
     const v = num(r.value); if (v == null) return;
-    const t = String(r.trait || ''); if (!t) return;
+    const t = traitName(r.trait); if (!t) return;
+    if (t !== r.trait) TRAIT_FIX = true;
+    // 名前を揃えた結果、同じ牛の同じ形質・同じ検査日が2つになることがある
+    const k = String(r.cow_no) + '|' + t + '|' + String(r.tested_at || '');
+    if (seen[k]) return;
+    seen[k] = 1;
     (by[t] = by[t] || []).push(v);
   });
   const out = {};
@@ -2548,6 +2618,82 @@ const Calc = {
       provisional: String(S['program.' + k + '.provisional'] || '') === '1',
       raw: S['program.' + k + '.schedule'] || ''
     };
+  },
+
+  /* ------------------------------------------------------------
+     これまで実際に与えてきた量から、プログラムを作る
+     ------------------------------------------------------------
+     和牛（C群）の給与量は仮の値のままで、「無理のない量か」の判定が
+     効いていませんでした。牧場にはもう実績がたまっているので、
+     それを日齢ごとに集計して、実際のやり方をプログラムにします。
+
+     recs … { cow_no, birth_date, feeds:[{date, volume_l}] } の配列
+     返り … { days:[{day, n, p25, p50, p75}], cows, schedule, lastDay }
+     ------------------------------------------------------------ */
+  programFromRecords(recs, opts){
+    opts = opts || {};
+    const minN = num(opts.minN, 3);          // この頭数に満たない日齢は使わない
+    const per = this.perDay() || 2;
+    const step = num(opts.step, 0.25);       // 1回あたりを何L刻みに丸めるか
+
+    // 牛ごと・日ごとに合計する（朝夕を足して「1日あたり」にする）
+    const byDay = {};
+    let cows = 0;
+    (recs || []).forEach(r => {
+      if (!r || !r.birth_date) return;
+      const sum = {};
+      (r.feeds || []).forEach(m => {
+        const d = daysBetween(r.birth_date, m.date);
+        if (d == null || d < 0 || d > 200) return;
+        const v = num(m.volume_l);
+        if (v == null || v < 0) return;
+        sum[d] = (sum[d] || 0) + v;
+      });
+      const keys = Object.keys(sum);
+      if (!keys.length) return;
+      cows++;
+      keys.forEach(d => { (byDay[d] = byDay[d] || []).push(sum[d]); });
+    });
+
+    const pctl = (a, q) => {
+      if (!a.length) return null;
+      const b = a.slice().sort((x, y) => x - y);
+      const i = (b.length - 1) * q;
+      const lo = Math.floor(i), hi = Math.ceil(i);
+      return lo === hi ? b[lo] : b[lo] + (b[hi] - b[lo]) * (i - lo);
+    };
+
+    const days = [];
+    Object.keys(byDay).map(Number).sort((a, b) => a - b).forEach(d => {
+      const a = byDay[d];
+      if (a.length < minN) return;
+      days.push({ day: d, n: a.length,
+                  p25: pctl(a, .25), p50: pctl(a, .5), p75: pctl(a, .75) });
+    });
+    if (!days.length) return { days: [], cows, schedule: '', lastDay: null };
+
+    // 中央値を「1回あたり」に直して、刻みに丸める
+    const perFeed = {};
+    days.forEach(x => {
+      perFeed[x.day] = Math.round(x.p50 / per / step) * step;
+    });
+
+    /* 段の切れ目だけを拾って「日齢:L」に直す。
+       日ごとに小さく上下するので、値が変わったところだけを書きます。 */
+    const out = [];
+    let last = null;
+    days.forEach(x => {
+      const v = perFeed[x.day];
+      if (last === null || Math.abs(v - last) >= step - 1e-9){
+        out.push(x.day + ':' + r2(v));
+        last = v;
+      }
+    });
+    const lastDay = days[days.length - 1].day;
+    // 記録が途切れたところで離乳（0）にしておく
+    if (last !== 0) out.push((lastDay + 1) + ':0');
+
+    return { days, cows, schedule: out.join(', '), lastDay };
   },
 
   /** 「日齢 → 1回あたりL / 1日あたりL」の配列に展開 */
@@ -6848,6 +6994,52 @@ function preweanCows(){
 }
 
 /* ------------------------------------------------------------
+   並べて入れる画面の「次へ」
+   ------------------------------------------------------------
+   メジャーを持って1頭ずつ読み上げながら入れるとき、
+   数字を入れるたびに画面をスクロールして次の欄を押すのが手間でした。
+   キーボードの「次へ」で、そのまま下の牛へ移ります。
+
+   ・押したときに中身を選んでおく（打ち直しが楽）
+   ・移った先は画面の真ん中に寄せる（キーボードで隠れないように）
+   ・いちばん下まで行ったら、キーボードを閉じる
+   ------------------------------------------------------------ */
+function focusField(f){
+  if (!f) return;
+  f.focus();
+  try { f.select(); } catch (e){ /* 数値欄で select が効かない端末もある */ }
+  const row = f.closest('[data-row]') || f;
+  setTimeout(() => row.scrollIntoView({ behavior: 'smooth', block: 'center' }), 60);
+}
+
+function wireStepThrough(fields){
+  fields.forEach((f, i) => {
+    f.setAttribute('enterkeyhint', i === fields.length - 1 ? 'done' : 'next');
+    f.addEventListener('focus', () => { try { f.select(); } catch (e){} });
+    f.addEventListener('keydown', e => {
+      if (e.key !== 'Enter') return;
+      e.preventDefault();
+      if (i < fields.length - 1) focusField(fields[i + 1]);
+      else { f.blur(); toast('いちばん下まで入れました'); }
+    });
+  });
+}
+
+/** まだ入っていない、いちばん上の欄へ飛ぶ */
+function focusFirstEmpty(fields){
+  const f = fields.find(x => String(x.value).trim() === '');
+  if (f){ focusField(f); return true; }
+  toast('空いている欄はありません');
+  return false;
+}
+
+/** 入った数 / 全部 を出す小さな行 */
+function filledLine(fields){
+  const n = fields.filter(x => String(x.value).trim() !== '').length;
+  return n + ' / ' + fields.length + ' 頭';
+}
+
+/* ------------------------------------------------------------
    出生体重をまとめて入れる
    ------------------------------------------------------------
    生まれた日に体重計で測って、あとからまとめて入れるための画面です。
@@ -6927,7 +7119,7 @@ function viewBirthWeights(){
                     style: 'text-align:right',
                     value: cur != null ? r1(cur) : '',
                     placeholder: '' });
-    const row = el('div', {
+    const row = el('div', { 'data-row': '1',
       style: 'display:flex;align-items:center;gap:10px;padding:9px 0;' +
              'border-bottom:1px solid var(--grid)' },
       el('div', { style: 'min-width:58px' },
@@ -6945,6 +7137,19 @@ function viewBirthWeights(){
     card.appendChild(row);
   });
   wrap.appendChild(card);
+
+  // キーボードの「次へ」で下の牛へ
+  const fields = inputs.map(x => x.f);
+  wireStepThrough(fields);
+  const prog = el('div', { class: 'hint', style: 'margin:0' });
+  const paintProg = () => { prog.textContent = '入力ずみ ' + filledLine(fields); };
+  fields.forEach(f => f.addEventListener('input', paintProg));
+  paintProg();
+  wrap.appendChild(el('div', { class: 'card tight' },
+    el('div', { style: 'display:flex;gap:10px;align-items:center' },
+      el('div', { style: 'flex:1' }, prog),
+      el('button', { class: 'btn sm', style: 'flex:none;padding:8px 14px',
+        onclick: () => focusFirstEmpty(fields) }, '空いている欄へ'))));
 
   /* --- 保存 --- */
   wrap.appendChild(el('div', { style: 'height:8px' }));
@@ -6990,14 +7195,24 @@ function viewBulk(kind){
     return p && p.perDay > 0;
   });
   const wrap = el('div');
+
+  // 体高はふだん測らない。出したい人だけ出す（覚えておきます）
+  const showHeight = kind === 'weight' && LS.get('sw.bulkHeight', false);
+
   const titles = { milk: '今日の哺乳を一括入力', starter: 'スターターを一括入力',
-                   weight: '胸囲・体高を一括入力' };
+                   weight: showHeight ? '胸囲・体高を一括入力' : '胸囲を一括入力' };
   App.setTop(titles[kind], cows.length + '頭', true);
 
   const fDate = inp({ type: 'date', value: today(), style: 'max-width:190px' });
   wrap.appendChild(el('div', { class: 'card tight' },
     el('div', { style: 'display:flex;gap:10px;align-items:center;flex-wrap:wrap' },
-      el('span', { style: 'font-size:calc(12.5px * var(--fs));color:var(--ink-2);font-weight:600' }, '日付'), fDate)));
+      el('span', { style: 'font-size:calc(12.5px * var(--fs));color:var(--ink-2);font-weight:600' }, '日付'), fDate,
+      kind === 'weight'
+        ? el('button', { class: 'btn sm ghost',
+            style: 'margin-left:auto;padding:6px 12px', 'aria-pressed': showHeight,
+            onclick: () => { LS.set('sw.bulkHeight', !showHeight); App.render(); } },
+            showHeight ? '体高を隠す' : '体高も入れる')
+        : null)));
 
   if (!cows.length){
     wrap.appendChild(el('div', { class: 'empty' }, '哺乳中の牛がいません'));
@@ -7018,7 +7233,8 @@ function viewBulk(kind){
     const d = ageDays(c.birth_date);
     const pk = Calc.programKey(c);
     const prog = Calc.programAt(pk, d);
-    const row = el('div', { style: 'display:flex;align-items:center;gap:10px;padding:9px 0;border-bottom:1px solid var(--grid)' });
+    const row = el('div', { 'data-row': '1',
+      style: 'display:flex;align-items:center;gap:10px;padding:9px 0;border-bottom:1px solid var(--grid)' });
     row.appendChild(el('div', { style: 'min-width:52px' },
       el('div', { style: 'font-size:calc(17px * var(--fs));font-weight:700;line-height:1.2' }, c.tag4),
       el('div', { style: 'font-size:calc(10.5px * var(--fs));color:var(--muted)' },
@@ -7042,8 +7258,11 @@ function viewBulk(kind){
     } else {
       const f = inp({ type: 'number', inputmode: 'decimal', step: '0.5',
                       style: 'text-align:right', placeholder: '胸囲' });
-      const fh = inp({ type: 'number', inputmode: 'decimal', step: '0.5',
-                       style: 'text-align:right', placeholder: '体高' });
+      // 体高はふだん測らないので、既定では出しません（⚙ で出せます）
+      const fh = showHeight
+        ? inp({ type: 'number', inputmode: 'decimal', step: '0.5',
+                style: 'text-align:right', placeholder: '体高' })
+        : null;
       const out = el('div', { style: 'flex:1;font-size:calc(11.5px * var(--fs));color:var(--muted);text-align:right' });
       const sync = () => {
         const w = Calc.estWeight(f.value);
@@ -7053,7 +7272,8 @@ function viewBulk(kind){
       };
       f.addEventListener('input', sync);
       row.appendChild(out);
-      row.appendChild(el('div', { style: 'width:150px;display:flex;align-items:center;gap:4px' },
+      row.appendChild(el('div', {
+        style: 'width:' + (showHeight ? 150 : 104) + 'px;display:flex;align-items:center;gap:4px' },
         f, fh, el('span', { style: 'font-size:calc(11px * var(--fs));color:var(--muted)' }, 'cm')));
       inputs.push({ cow: c, f, fh });
     }
@@ -7065,6 +7285,22 @@ function viewBulk(kind){
     wrap.appendChild(el('button', { class: 'btn ghost', style: 'margin-bottom:10px',
       onclick: () => { inputs.forEach(i => { if (i.prog && !i.f.value) i.f.value = r1(i.prog.perFeed); }); } },
       'プログラムの量をまとめて入れる'));
+
+  /* キーボードの「次へ」で下の牛へ移れるようにする。
+     メジャーを持って読み上げながら入れるとき、これが無いと
+     1頭ごとに画面をスクロールして欄を押すことになります。 */
+  const fields = inputs.map(i => i.f);
+  wireStepThrough(fields);
+
+  const prog = el('div', { class: 'hint', style: 'margin:10px 0 0' });
+  const paintProg = () => { prog.textContent = '入力ずみ ' + filledLine(fields); };
+  fields.forEach(f => f.addEventListener('input', paintProg));
+  paintProg();
+  wrap.appendChild(el('div', { class: 'card tight' },
+    el('div', { style: 'display:flex;gap:10px;align-items:center' },
+      el('div', { style: 'flex:1' }, prog),
+      el('button', { class: 'btn sm', style: 'flex:none;padding:8px 14px',
+        onclick: () => focusFirstEmpty(fields) }, '空いている欄へ'))));
 
   const btn = el('button', { class: 'btn primary' }, '保存する');
   btn.onclick = () => submitting(btn, async () => {
@@ -7813,6 +8049,12 @@ function viewSettings(){
     const pi = bind('program.' + k + '.schedule', { type: 'text' });
     progIns[k] = pi;
     box.appendChild(field('プログラム（日齢:L/回）', pi));
+    /* この牧場でこれまで実際に与えてきた量から作り直す。
+       和牛のように「仮の値のまま」だった群は、これで実態に合わせられます。 */
+    box.appendChild(el('button', {
+      class: 'btn sm ghost', style: 'width:100%;margin:-4px 0 12px',
+      onclick: () => openProgramFromRecords(k, pi, drawProg)
+    }, '📊　この牧場の実績から作る'));
     box.appendChild(el('div', { class: 'grid2' },
       field('離乳の最短 (日齢)', bind('program.' + k + '.wean_min', { type: 'number', inputmode: 'numeric' })),
       field('離乳の最長 (日齢)', bind('program.' + k + '.wean_max', { type: 'number', inputmode: 'numeric' }))));
@@ -7821,7 +8063,7 @@ function viewSettings(){
 
   const progChart = el('div', { style: 'margin-top:8px' });
   const COLORS = ['--s1','--s2','--s7','--s3','--s4'];
-  const drawProg = () => {
+  function drawProg(){
     progChart.innerHTML = '';
     const keys = Calc.programKeys();
     const saved = {};
@@ -7845,7 +8087,7 @@ function viewSettings(){
       caption: '縦軸は1日あたりのL（1回あたり × ' + (Calc.perDay() || 2) +
                '回）。ピーク量を変えたときの見え方をここで比べられます。'
     }));
-  };
+  }
   Object.values(progIns).forEach(i => i.addEventListener('input', drawProg));
   drawProg();
   c3.appendChild(progChart);
@@ -8092,6 +8334,89 @@ function viewSettings(){
     wrap.appendChild(cs);
   }
 
+  /* --- 育成牛の登録 --- */
+  /* 離乳が終わってから10ヶ月までは、月齢だけで育成牛と決まります。
+     ゲノム表や在籍牛一覧から入った牛は性別・品種が空のままのことがあり、
+     そのままだと発育曲線の相手（品種別の標準）が決まりません。
+     1頭ずつ直すと17頭で17往復かかるので、ここで1往復にまとめます。 */
+  {
+    const todo = Store.cows.filter(c =>
+      Calc.groupOf(c).key === 'growing' && (!c.sex || !c.breed));
+    const gc2 = el('div', { class: 'card' });
+    gc2.appendChild(el('h2', {}, '育成牛の登録',
+      el('span', { class: 'note' }, '離乳後〜' + r0(num(Calc.S()['group.breeding_month'], 10)) + 'ヶ月')));
+    if (!todo.length){
+      gc2.appendChild(el('div', { class: 'hint' },
+        '離乳後〜' + r0(num(Calc.S()['group.breeding_month'], 10)) + 'ヶ月の牛は、',
+        'すべて育成牛として登録済みです。'));
+    } else {
+      gc2.appendChild(el('div', { class: 'hint', style: 'margin-bottom:10px' },
+        todo.length + '頭が、性別か品種が空のままです。',
+        'この月齢は間違いなく育成牛なので、雌・ホルスタインとしてまとめて登録できます。',
+        el('br'), '（すでに入っている値は書き換えません）'));
+      const slot2 = el('div', { style: 'margin-bottom:10px' });
+      todo.slice(0, 40).forEach(c => slot2.appendChild(el('div', {
+        style: 'display:flex;gap:10px;padding:6px 0;border-bottom:1px solid var(--grid);' +
+               'font-size:var(--t1)' },
+        el('b', { style: 'min-width:52px;font-variant-numeric:tabular-nums' },
+          c.mgmt_no || mid4(c.cow_no)),
+        el('div', { style: 'flex:1;min-width:0;color:var(--muted)' },
+          [fmtDate(c.birth_date), r1(ageMonths(c.birth_date)) + 'ヶ月',
+           c.sex || '性別なし', c.breed || '品種なし'].filter(Boolean).join('　')))));
+      if (todo.length > 40) slot2.appendChild(el('div', { class: 'hint' },
+        'ほか ' + (todo.length - 40) + '頭'));
+      gc2.appendChild(slot2);
+      const bG = el('button', { class: 'btn primary', style: 'width:100%' },
+        '🐄　' + todo.length + '頭を育成牛として登録する');
+      bG.onclick = () => submitting(bG, async () => {
+        await Store.saveCowsMany(todo.map(c => ({
+          cow_no: c.cow_no,
+          sex: c.sex || '雌',
+          breed: c.breed || 'ホルスタイン'
+        })));
+        // 品種が決まると、発育曲線の相手（品種別の標準）が変わる
+        Analysis.reset(); MilkBoard.reset();
+        toast(todo.length + '頭を育成牛として登録しました');
+        App.render();
+      });
+      gc2.appendChild(bG);
+    }
+    wrap.appendChild(gc2);
+  }
+
+  /* --- ゲノムの形質名を揃える --- */
+  /* 画面では読むときに TPI へ揃えているので、これを押さなくても見え方は同じ。
+     押すと、スプレッドシートの中の文字と、書き出した Excel も揃います。
+     直すものが無いときは、このカードそのものを出しません。 */
+  if (TRAIT_FIX){
+    const tc = el('div', { class: 'card' });
+    tc.appendChild(el('h2', {}, 'ゲノムの形質名'));
+    tc.appendChild(el('div', { class: 'hint', style: 'margin-bottom:10px' },
+      '2026年9月のゲノム表から、TPI が「IPI」と書かれるようになりました。同じものです。',
+      el('br'), '画面では TPI に揃えて出していますが、',
+      'スプレッドシートの中はまだ「IPI」のままの記録があります。',
+      el('br'), 'ここで直すと、書き出した Excel も TPI になります。'));
+    const bT = el('button', { class: 'btn', style: 'width:100%' }, '形質の名前を TPI に揃える');
+    bT.onclick = () => submitting(bT, async () => {
+      let d;
+      try { d = await Store.call({ action: 'fixTraits' }); }
+      catch (e){
+        // Code.gs がまだ古いときは、ここだけできない（画面の見え方は揃ったまま）
+        if (/不明な操作/.test(String(e && e.message))){
+          toast('スプレッドシート側（Code.gs）の貼り替えが先に必要です', true); return;
+        }
+        throw e;
+      }
+      const n = (d && d.fixed) || 0;
+      // 画面はすでに TPI で出ているので、読み直す必要はありません
+      TRAIT_FIX = false;
+      toast(n ? n + '件を TPI に揃えました' : '直すものはありませんでした');
+      App.render();
+    });
+    tc.appendChild(bT);
+    wrap.appendChild(tc);
+  }
+
   /* --- 死亡した牛 --- */
   /* 死んだ牛はアプリの名簿から外していますが、記録は消していません。
      いつでもここから見られて、間違えたときは戻せます。 */
@@ -8215,9 +8540,12 @@ async function exportAll(){
 const PRESETS = [
   {
     id: 'genome',
-    label: 'ゲノム表（8.26database）',
-    hint: 'Excelの「8.26database」シートをそのまま読み込みます。個体・血統・ゲノム値が一度に入ります。',
-    detect: h => h.includes('管理番号') && h.includes('個体識別番号') && h.includes('親'),
+    label: 'ゲノム表（database シート）',
+    hint: 'Excelの「26.09.18database」のようなシートをそのまま読み込みます。' +
+          '個体・血統・ゲノム値が一度に入り、離乳後〜10ヶ月の牛は育成牛として登録されます。',
+    // 月によって「親」の列が無い書き出しもあるので、種雄牛でも見分けられるようにする
+    detect: h => h.includes('管理番号') && h.includes('個体識別番号') &&
+                 (h.includes('親') || h.includes('種雄牛')),
     dedupe: { genomics: ['cow_no','subject','trait','tested_at'] },
     run: (rows, ctx) => importGenomeSheet(rows, ctx)
   },
@@ -8426,9 +8754,14 @@ function viewImport(){
           useSheet(s);
         } }, s.name + '（' + (s.rows.length - 1) + '行）'))));
       stepP.appendChild(box);
-      // 佐藤さんが「これを指標に」と指定した 8.26database を優先して選ぶ
-      const pref = withData.find(s => /8\.?26\s*database/i.test(s.name)) ||
-                   withData.find(s => /database/i.test(s.name)) || withData[0];
+      /* ゲノム表には月ごとの database シートが増えていきます。
+         名前から日付が読めるものの中で、いちばん新しいものを最初に開きます。
+         （古い月を選んでも構いませんが、ふつう入れたいのは最新の評価なので） */
+      const dbs = withData.filter(s => /database/i.test(s.name));
+      const dated = dbs.map(s => ({ s, d: sheetNameToDate(s.name, '') || '' }))
+                       .filter(x => x.d)
+                       .sort((a, b) => a.d < b.d ? 1 : -1);
+      const pref = (dated[0] && dated[0].s) || dbs[0] || withData[0];
       $$('#sheetPick .chip').forEach(x => {
         if (x.dataset.sheet === pref.name) x.setAttribute('aria-pressed','true'); });
       useSheet(pref);
@@ -8648,7 +8981,9 @@ function importGenomeSheet(rows, ctx){
   const iEar  = colIndex(H, '個体識別番号');
   const iDam  = colIndex(H, '親');
   const iBirth= colIndex(H, '生年月日');
-  const iStat = colIndex(H, '在籍/その他');
+  // 2026-09 のゲノム表から、列名の多くに「正式表示」が付くようになりました。
+  // 古い表（8.26database）も読めるよう、両方の名前を見ます。
+  const iStat = colIndex(H, '在籍/その他', '在籍/その他正式表示');
   const iSire = colIndex(H, '種雄牛');
   const iTest = colIndex(H, '検査結果正式表示', '検査結果');
 
@@ -8658,7 +8993,7 @@ function importGenomeSheet(rows, ctx){
   const traits = [];
   H.forEach((h, i) => {
     if (skip.has(i)) return;
-    const name = String(h || '').trim().replace(/正式表示$/, '');
+    const name = traitName(String(h || ''));
     if (name) traits.push({ i, name });
   });
 
@@ -8671,19 +9006,35 @@ function importGenomeSheet(rows, ctx){
   let newestBirth = '';
   body.forEach(r => { const b2 = dateCell(r, iBirth); if (b2 > newestBirth) newestBirth = b2; });
   const testedAt = sheetNameToDate(ctx && ctx.sheetName, newestBirth) || newestBirth || today();
+  const known = {};
+  Store.cows.forEach(c => { if (c.cow_no) known[String(c.cow_no)] = c; });
+  let growingN = 0;
   body.forEach(r => {
     const ear = cell(r, iEar).replace(/[^0-9]/g, '');
     const mgmt = cell(r, iMgmt).replace(/[^0-9A-Za-z]/g, '');
     if (!ear && !mgmt) return;
     const key = ear || ('M' + mgmt);
     const stat = cell(r, iStat);
-    cows.push({
+    const birth = dateCell(r, iBirth);
+    const ex = known[key];
+    const c2 = {
       cow_no: key, mgmt_no: mgmt, dam_mgmt_no: cell(r, iDam).replace(/[^0-9A-Za-z]/g, ''),
-      birth_date: dateCell(r, iBirth),
+      birth_date: birth,
       sire_name: cell(r, iSire),
       // 品種は上書きしない（和牛として登録済みの牛を潰さないため）
       status: (stat === 'その他') ? '売却・廃用' : '在籍'
-    });
+    };
+    /* 離乳後〜10ヶ月の牛は、群を取り違えようがない育成牛です。
+       ここで性別と品種まで入れて登録済みにしてしまい、
+       1頭ずつ出生登録をやり直さなくて済むようにします。
+       （ゲノム表に載るのは後継の雌・ホルスタインなので、
+         分かっていない項目にだけ入れ、既に入っている値は触りません） */
+    if (c2.status === '在籍' && growingByAge(birth, ex && ex.breed)){
+      if (!ex || !ex.sex)   c2.sex   = '雌';
+      if (!ex || !ex.breed) c2.breed = 'ホルスタイン';
+      if (!ex || !ex.sex || !ex.breed) growingN++;
+    }
+    cows.push(c2);
     traits.forEach(t => {
       const v = numCell(r, t.i);
       if (v === '') return;
@@ -8691,7 +9042,15 @@ function importGenomeSheet(rows, ctx){
     });
   });
   return { cows, genomics: genes,
-    summary: cows.length + '頭・ゲノム値' + genes.length + '件' };
+    summary: cows.length + '頭・ゲノム値' + genes.length + '件'
+      + (growingN ? '（うち育成牛 ' + growingN + '頭を登録）' : '')
+      + '・検査日 ' + fmtDate(testedAt) };
+}
+
+/** 離乳後〜10ヶ月か（＝育成牛として登録してよい月齢か） */
+function growingByAge(birthDate, breed){
+  if (!birthDate) return false;
+  return Calc.groupOf({ birth_date: birthDate, breed: breed || '' }).key === 'growing';
 }
 
 /** 在籍牛一覧（牛群検定CSV）→ 個体（既存に上書き合流）＋ 繁殖 ＋ 乳検 */
@@ -8848,9 +9207,18 @@ function importBodyWeight(rows){
       + (unmatched.length ? '（うち' + unmatched.length + '頭は新規登録）' : '') };
 }
 
-/** 「8.26database」「07.07」のようなシート名を日付にする */
+/** 「8.26database」「07.07」「26.09.18database」のようなシート名を日付にする */
 function sheetNameToDate(name, notBefore){
-  const m = String(name || '').match(/(\d{1,2})[.\-\/](\d{1,2})/);
+  const s = String(name || '');
+  // 「26.09.18database」のように 年.月.日 が並んでいる形。
+  // eGプラスの新しい書き出しがこの形なので、年まで読めるときは年を信じる。
+  const m3 = s.match(/(\d{2}|\d{4})[.\-\/](\d{1,2})[.\-\/](\d{1,2})/);
+  if (m3){
+    let y = +m3[1]; if (y < 100) y += 2000;
+    const mo3 = +m3[2], da3 = +m3[3];
+    if (mo3 >= 1 && mo3 <= 12 && da3 >= 1 && da3 <= 31) return ymd(new Date(y, mo3 - 1, da3));
+  }
+  const m = s.match(/(\d{1,2})[.\-\/](\d{1,2})/);
   if (!m) return null;
   const mo = +m[1], da = +m[2];
   if (mo < 1 || mo > 12 || da < 1 || da > 31) return null;
@@ -9128,6 +9496,123 @@ function milkByDayRows(src, cowBy){
               t.refused, t.feces, Array.from(new Set(t.note)).join(' / ')];
     });
   return [head].concat(body);
+}
+
+
+/* ------------------------------------------------------------
+   この牧場の実績から、哺乳プログラムを作る
+   ------------------------------------------------------------
+   和牛（C群）の給与量は、作ったときから仮の値のままでした。
+   仮の値だと「この牛にとって無理のない量か」の判定が効きません。
+   牧場にはもう実際に与えてきた記録がたまっているので、
+   それを日齢ごとに集計して、実態に合わせたプログラムにします。
+
+   勝手には書き換えません。見てもらって、納得したときだけ入れ替えます。
+   ------------------------------------------------------------ */
+function openProgramFromRecords(key, input, redraw){
+  const meta = Calc.programMeta(key);
+  sheet(meta.name + ' — この牧場の実績から作る', (b, close) => {
+    const slot = el('div');
+    b.appendChild(slot);
+    slot.appendChild(el('div', { class: 'empty' },
+      el('div', { class: 'spinner' }),
+      el('div', { style: 'margin-top:12px' }, '記録を集めています…')));
+
+    (async () => {
+      // この群で育てた牛（出荷した牛も含める。和牛は1か月で出るため）
+      const cows = Store.cows.filter(c => Calc.programKey(c) === key && c.birth_date);
+      if (!cows.length){
+        slot.innerHTML = '';
+        slot.appendChild(el('div', { class: 'empty' }, 'この群の牛がいません'));
+        return;
+      }
+      const nos = cows.map(c => c.cow_no);
+      try { await Store.prefetch(nos, ['milk_feed']); } catch (e){ /* 手元のぶんで作る */ }
+
+      const recs = cows.map(c => {
+        const rec = Store.cache[String(c.cow_no)];
+        return { cow_no: c.cow_no, birth_date: c.birth_date,
+                 feeds: (rec && rec.milk_feed) || [] };
+      }).filter(r => r.feeds.length);
+
+      const res = Calc.programFromRecords(recs);
+      slot.innerHTML = '';
+
+      if (!res.days.length){
+        slot.appendChild(el('div', { class: 'note warn' },
+          el('b', {}, '作れるだけの記録がありません。'),
+          ' 同じ日齢で3頭ぶん以上の哺乳の記録がたまると、ここから作れるようになります。',
+          el('br'), 'いまこの群の牛は ', el('b', {}, cows.length + '頭'),
+          '、記録のある牛は ', el('b', {}, recs.length + '頭'), ' です。'));
+        slot.appendChild(el('button', { class: 'btn ghost', style: 'width:100%;margin-top:12px',
+          onclick: close }, '閉じる'));
+        return;
+      }
+
+      const per = Calc.perDay() || 2;
+      slot.appendChild(el('div', { class: 'note' },
+        el('b', {}, recs.length + '頭'), ' の、これまで実際に与えてきた量から作りました。',
+        el('br'), '日齢ごとの', el('b', {}, '中央値'), 'を使っています（同じ日齢で3頭以上ある日だけ）。',
+        el('br'), '記録があるのは ', el('b', {}, '1〜' + res.lastDay + '日齢'),
+        ' です。それより先は離乳（0）にしてあります。'));
+
+      /* 実績と、いまのプログラムを重ねて出す */
+      const now = Calc.program(key).filter(x => x.day <= res.lastDay + 10);
+      slot.appendChild(Chart.plot({
+        height: 220,
+        x: { domain: [0, res.lastDay + 10], fmt: v => r0(v) + '日', tip: v => r0(v) + '日齢' },
+        y: { zero: true, fmt: v => r1(v) },
+        bands: [{ name: '実績の25〜75%', color: cssVar('--band'),
+                  points: res.days.map(d => ({ x: d.day, lo: d.p25, hi: d.p75 })) }],
+        series: [
+          { name: '実績の中央値', color: cssVar('--s1'), width: 2.6,
+            points: res.days.map(d => ({ x: d.day, y: d.p50 })),
+            fmt: v => r1(v) + ' L/日（' + r1(v / per) + ' L/回）' },
+          { name: 'いまのプログラム', color: cssVar('--s3'), width: 1.8, dashed: true,
+            noEndLabel: true, points: now.map(x => ({ x: x.day, y: x.l })),
+            fmt: v => r1(v) + ' L/日' }
+        ],
+        caption: '縦軸は1日あたりのL。青が実際に与えてきた量、緑の破線がいまの設定です。'
+      }));
+
+      /* 作ったプログラムの中身 */
+      slot.appendChild(el('div', { class: 't-micro',
+        style: 'color:var(--muted);font-weight:700;margin:14px 0 5px' }, '作ったプログラム'));
+      slot.appendChild(el('div', {
+        style: 'background:var(--surface-2);border-radius:var(--r-sm);padding:11px 12px;' +
+               'font-size:var(--t1);line-height:1.7;word-break:break-all' },
+        res.schedule));
+
+      /* 何頭ぶんの記録で作ったかを、日齢ごとに見せる */
+      const thin = res.days.filter(d => d.n < 6);
+      if (thin.length)
+        slot.appendChild(el('div', { class: 'hint', style: 'margin-top:8px' },
+          '頭数が少ない日齢もあります（',
+          thin.slice(0, 6).map(d => d.day + '日:' + d.n + '頭').join('　'),
+          thin.length > 6 ? ' …' : '', '）。'));
+
+      slot.appendChild(el('div', { class: 'note warn', style: 'margin-top:12px' },
+        'これは', el('b', {}, 'これまでのやり方をそのまま写したもの'), 'です。',
+        'よい・悪いの判断はしていません。',
+        el('br'), '中身を見て、直したいところがあれば入れ替えたあとに手で直してください。'));
+
+      const ok = el('button', { class: 'btn primary', style: 'width:100%;margin-top:6px' },
+        'このプログラムにする');
+      ok.onclick = () => {
+        input.value = res.schedule;
+        input.dispatchEvent(new Event('input'));    // 下のグラフとプレビューに反映
+        if (redraw) redraw();
+        close();
+        toast('入れ替えました。下の「保存する」で確定します', false);
+      };
+      slot.appendChild(ok);
+      slot.appendChild(el('button', { class: 'btn ghost', style: 'width:100%;margin-top:8px',
+        onclick: close }, 'やめる'));
+    })().catch(e => {
+      slot.innerHTML = '';
+      slot.appendChild(el('div', { class: 'note crit' }, e.message || String(e)));
+    });
+  }, { focus: false });
 }
 
 /* ------------------------------------------------------------
