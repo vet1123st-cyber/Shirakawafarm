@@ -251,6 +251,13 @@ textarea.inp{min-height:84px;resize:vertical;line-height:1.55}
 .badge.warn{background:color-mix(in srgb,var(--warn) 26%,transparent);
   color:color-mix(in srgb,var(--warn) 50%,var(--ink))}
 .badge.crit{background:color-mix(in srgb,var(--crit) 16%,transparent);color:var(--crit)}
+/* 気になる牛の印。
+   毎朝ぜんぶの牛に並ぶので、派手だと「いつものこと」になって効かなくなる。
+   地の色にうすく混ぜるだけにして、強いほうだけ少し濃くする。 */
+.badge.soft{background:color-mix(in srgb,var(--warn) 10%,var(--surface-2));
+  color:var(--ink-2);font-weight:600}
+.badge.soft.hi{background:color-mix(in srgb,var(--crit) 9%,var(--surface-2));
+  color:color-mix(in srgb,var(--crit) 58%,var(--ink))}
 
 /* テーブル */
 .tblwrap{overflow-x:auto;-webkit-overflow-scrolling:touch;margin:0 -16px;padding:0 16px}
@@ -905,7 +912,7 @@ const EVENT_TYPES = ['増乳開始','ピーク到達','減乳開始','離乳','�
  *               表や列が増えたときだけ上げる。上げたら Code.gs のデプロイも必要。
  * BUILD_ID     … この index.html を作った日時。作るたびに毎回変わる。
  *               「新しい画面が出ていないか」を見るためだけに使う。
- *               build.sh が 2026-09-21-0631 を実際の日時に置き換えます。
+ *               build.sh が 2026-10-04-0647 を実際の日時に置き換えます。
  */
 /* カルテを開いた瞬間に要る表と、タブを開いたときでいい表 */
 const COW_CORE_TABLES = ['weights', 'milk_feed', 'starter', 'repro', 'events', 'colostrum'];
@@ -966,13 +973,13 @@ function fixBenchmark(bm){
   return bm;
 }
 
-const APP_VERSION = '2026-09-21a';
+const APP_VERSION = '2026-09-23a';
 /* 起動を待たせないための「前回の内容」の形。
    受け取る中身の作りを変えたときだけ、ここを上げます。
    以前は BUILD_ID を目印にしていたので、画面を1文字直して作り直すたびに
    全員の控えが捨てられ、更新した日の朝だけ待たされていました。 */
 const DATA_SHAPE = '3';
-const BUILD_ID = '2026-09-21-0631';
+const BUILD_ID = '2026-10-04-0647';
 const REQUIRED_TABLES = ['cows', 'weights', 'milk_feed', 'starter', 'repro', 'events',
                          'genomics', 'milk_test', 'colostrum', 'pens', 'daily_check',
                          'milk_plan', 'settings'];
@@ -2042,6 +2049,7 @@ function normalizeCow(c){
   o.dam_mgmt_no = String(o.dam_mgmt_no || '').trim().replace(/[\s ]/g, '');
   o.dam_no = String(o.dam_no || '').trim();
   o.due_date = ymd(o.due_date) || String(o.due_date || '');
+  o.wean_date = ymd(o.wean_date) || '';
   // 画面に大きく出す4桁。原則は個体識別番号の真ん中4桁
   o.tag4 = mid4(o.cow_no) || o.mgmt_no;
   // 手で別番号を入れている場合はそちらを優先する
@@ -2483,13 +2491,24 @@ const Calc = {
     const key = this.programKey(cow);
     const meta = this.programMeta(key);
     const marks = this.programMarks(key);
-    const wean = marks.weanDay || meta.weanMax;
+    /* プログラムの離乳日齢は目安。
+       現場が「この日に離乳した」と入れていれば、その日を離乳日として使います。
+       入れた日より前の日を見ているときは、まだ哺乳中として扱います
+       （前の日の哺乳を直しにいっても、ちゃんとボードに出るように）。 */
+    const actual = daysBetween(cow.birth_date, cow.wean_date);
+    const weaned = actual != null && actual >= 0 && d >= actual;
+    const wean = (actual != null && actual >= 0) ? actual
+                                                 : (marks.weanDay || meta.weanMax);
     const trans = num(S['group.wean_transition_days'], 14);
 
-    if (d < (marks.peakStart || 35)) return GROUPS.milk1;
-    if (d < (marks.peakEnd || 50))   return GROUPS.milk2;
-    if (d < wean)                    return GROUPS.milk3;
-    if (d < wean + trans)            return GROUPS.milk4;
+    /* 離乳したと入れてあれば、日齢が何日でも増乳・ピーク・減乳には戻しません。
+       目安より早くやめる子がいるので、ここは入力のほうを信じます。 */
+    if (!weaned){
+      if (d < (marks.peakStart || 35)) return GROUPS.milk1;
+      if (d < (marks.peakEnd || 50))   return GROUPS.milk2;
+      if (d < wean)                    return GROUPS.milk3;
+    }
+    if (d < wean + trans)              return GROUPS.milk4;
 
     // 未経産で受胎している（分娩予定日がある）
     if (cow.due_date) return GROUPS.pregnant;
@@ -3090,7 +3109,7 @@ const Calc = {
     });
 
     /* --- 現在のステージ --- */
-    out.stage = this.stageOf(out, rec);
+    out.stage = this.stageOf(out, rec, cow);
 
     /* --- 予測 --- */
     out.forecast = this.forecast(out, rec);
@@ -3108,11 +3127,105 @@ const Calc = {
     return out;
   },
 
-  stageOf(a, rec){
+  /* ------------------------------------------------------------
+     哺乳から離乳までの振り返り
+     ------------------------------------------------------------
+     プログラムの予定ではなく、**実際に飲ませた記録だけ**で組み立てます。
+     「この子に何が起きたか」を見るためのものなので、
+     下痢で減らした日も、思ったより早くやめた日も、そのまま出ます。
+     ------------------------------------------------------------ */
+
+  /** 哺乳の記録 → 日ごとの {日齢, L, 粉g, 乾物kg}（一覧で何頭ぶんも作るので軽く） */
+  dailyMilk(cow, feeds){
+    const birth = cow && cow.birth_date;
+    const byDay = {};
+    (feeds || []).forEach(m => {
+      const d = daysBetween(birth, m.date);
+      if (d == null || d < 0) return;
+      // 回数つき（朝・夕）の記録があれば、その日はそちらだけを使う。
+      // 1日まとめの記録と混ぜると二重に数えてしまうため（analyze と同じ考え方）
+      const per = /^[0-9]+$/.test(String(m.feeding_no || '').trim());
+      (byDay[d] = byDay[d] || { day: d, per: [], whole: [] })[per ? 'per' : 'whole'].push(m);
+    });
+    return Object.keys(byDay).map(Number).sort((a, b) => a - b).map(d => {
+      const g = byDay[d];
+      const use = g.per.length ? g.per : g.whole;
+      let L = 0, pg = 0, dm = 0;
+      use.forEach(m => { L += num(m.volume_l, 0) || 0; pg += this.powderG(m); dm += this.milkDM(m); });
+      return { day: d, milkL: L, powderG: pg, milkDM: dm, starterDM: 0 };
+    });
+  },
+
+  /**
+   * 1頭ぶんのまとめ。daily は analyze の out.daily か dailyMilk() のどちらでも。
+   * 離乳日が入っていればそこまでを数えます（入っていなければ最後の記録の翌日）。
+   */
+  weanSummary(cow, daily){
+    const fed = (daily || []).filter(d => (d.milkL || 0) > 0);
+    if (!fed.length) return null;
+    const S = this.S();
+    const birth = cow && cow.birth_date;
+
+    const wd = daysBetween(birth, cow && cow.wean_date);
+    const hasWean = wd != null && wd >= 0;
+    const lastFeed = fed[fed.length - 1].day;
+    const weanDay = hasWean ? wd : lastFeed + 1;
+    const weanDate = hasWean ? ymd(cow.wean_date) : (birth ? addDays(birth, weanDay) : '');
+
+    // 離乳日より後の記録は数えません（あとから日付を直したときのため）
+    const use = fed.filter(d => d.day < weanDay);
+    if (!use.length) return null;
+
+    /* ピークは「いちばん飲んだ1日量」。
+       同じ量が続いた日をひとまとめにして「ピーク期」とします。
+       0.25L の幅をみているのは、朝夕で端数が出ることがあるためです。 */
+    const tol = 0.25;
+    const peakL = use.reduce((m, d) => Math.max(m, d.milkL), 0);
+    const atPeak = use.filter(d => d.milkL >= peakL - tol);
+    const peakStart = atPeak.length ? atPeak[0].day : null;
+    const peakEnd   = atPeak.length ? atPeak[atPeak.length - 1].day : null;
+    const peakDays  = (peakStart != null && peakEnd != null) ? peakEnd - peakStart + 1 : null;
+
+    // 減乳開始＝ピーク期のあと、はじめてピークより減った日
+    const down = peakEnd == null ? null
+      : use.find(d => d.day > peakEnd && d.milkL < peakL - tol);
+    const stepDownDay = down ? down.day : null;
+    const downDays = stepDownDay != null ? weanDay - stepDownDay : null;
+
+    let powderG = 0, milkDM = 0, milkL = 0, starterDM = 0;
+    use.forEach(d => {
+      powderG += d.powderG || 0; milkDM += d.milkDM || 0;
+      milkL += d.milkL || 0; starterDM += d.starterDM || 0;
+    });
+    const dmPct = num(S['milk.replacer_dm_pct'], 96) / 100;
+
+    return {
+      cow_no: cow && cow.cow_no, tag4: cow && cow.tag4,
+      hasWean, weanDay, weanDate,
+      firstDay: use[0].day, lastFeed,
+      fedDays: use.length,
+      peakL, peakStart, peakEnd, peakDays,
+      stepDownDay,
+      stepDownDate: (birth && stepDownDay != null) ? addDays(birth, stepDownDay) : '',
+      downDays,
+      milkL,
+      powderKg: powderG / 1000,
+      powderDM: powderG / 1000 * dmPct,
+      milkDM, starterDM,
+      perDayL: use.length ? milkL / use.length : null,
+      daily: use
+    };
+  },
+
+  stageOf(a, rec, cow){
     const ev = (rec.events || []).slice().sort((x,y) => String(x.date) < String(y.date) ? -1 : 1);
     const find = t => ev.filter(e => e.type === t).pop();
     const wean = find('離乳'), down = find('減乳開始'), peak = find('ピーク到達'), ramp = find('増乳開始');
     const day = a.ageDays;
+    // 牛に入れた離乳日がいちばん強い（哺乳ボードで押したもの）
+    const wd = cow && ymd(cow.wean_date);
+    if (wd && ymd(today()) >= wd)
+      return { key: 'weaned', label: '離乳済み', since: wd, source: '入力' };
     if (wean) return { key: 'weaned', label: '離乳済み', since: wean.date, source: '記録' };
     if (down) return { key: 'stepdown', label: '減乳期', since: down.date, source: '記録' };
     if (peak) return { key: 'peak', label: 'ピーク期', since: peak.date, source: '記録' };
@@ -3224,6 +3337,26 @@ const Calc = {
 
     /* 3) 統合 */
     let weanDay = null, basis = '';
+    /* 実際に離乳した日が入っていれば、それが答え。予測はもう要らない。
+       （予測の中身は「なぜその日になるはずだったか」として残します） */
+    const done = daysBetween(a.cow && a.cow.birth_date, a.cow && a.cow.wean_date);
+    if (done != null && done >= 0){
+      return {
+        weanDay: done, weanDate: ymd(a.cow.wean_date), done: true,
+        stepDownDay: null, stepDownDate: null,
+        peakStartDay: marks.peakStart || null,
+        peakStartDate: marks.peakStart ? addDays(a.cow.birth_date, marks.peakStart) : null,
+        peakEndDay: marks.peakEnd || null,
+        rampDay: marks.rampStart || null,
+        rampDate: marks.rampStart ? addDays(a.cow.birth_date, marks.rampStart) : null,
+        dayByStarter: dayByStarter != null ? Math.round(dayByStarter) : null,
+        dayByWeight: dayByWeight != null ? Math.round(dayByWeight) : null,
+        basis: '入力された離乳日', clamped: false, reasons: [], confidence: 1,
+        peakL: marks.peakL, peakPerDay: marks.peakPerDay,
+        programKey: meta.key, programName: meta.name, weanMin: minD, weanMax: maxD,
+        targetKg: bw ? bw * mult : null
+      };
+    }
     if (dayByStarter != null && dayByWeight != null){
       weanDay = Math.max(dayByStarter, dayByWeight);
       basis = weanDay === dayByStarter ? 'スターター摂取が律速' : '増体が律速';
@@ -4904,14 +5037,22 @@ function tabOverview(v, cow, a){
   const todayDaily = a.daily.find(d => d.day === day);
   const weaned = a.stage.key === 'weaned' || !prog || prog.perDay <= 0;
   if (weaned){
+    const wd = ymd(cow.wean_date);
     todo.appendChild(el('div', { class: 'note' },
       el('b', {}, '離乳済みです。'),
-      a.forecast.weanDay != null
-        ? ' 離乳の目安は ' + a.forecast.weanDay + '日齢でした（現在 ' + day + '日齢）。'
-        : '',
+      wd
+        ? ' ' + fmtDateFull(wd) + 'に離乳（' +
+          (daysBetween(cow.birth_date, wd) != null ? daysBetween(cow.birth_date, wd) + '日齢' : '') + '）。'
+        : (a.forecast.weanDay != null
+            ? ' 離乳の目安は ' + a.forecast.weanDay + '日齢でした（現在 ' + day + '日齢）。'
+            : ''),
       el('div', { style: 'margin-top:6px' },
         '育成期の目標増体は ' + r2(num(Calc.S()['target.dg_growing'], .8)) + ' kg/日、',
         '種付け目標は ' + r0(num(Calc.S()['target.breeding_weight_kg'], 380)) + ' kg です。')));
+    // 離乳が済んだら、その子の哺乳をまとめて振り返れるようにする
+    todo.appendChild(el('button', { class: 'btn', style: 'width:100%;margin-top:9px',
+      onclick: () => { WeanReport.cow = cow.cow_no; App.go('weanreport'); } },
+      '🍼　この牛の哺乳〜離乳のまとめ'));
   } else if (prog){
     todo.appendChild(el('div', { class: 'grid2' },
       el('div', { class: 'tile' },
@@ -4945,6 +5086,14 @@ function tabOverview(v, cow, a){
     el('button', { class: 'btn ' + (weaned ? 'primary ' : '') + 'sm',
       onclick: () => openWeightForm(cow) }, '体重・胸囲'),
     weaned ? el('button', { class: 'btn sm', onclick: () => openReproForm(cow) }, '繁殖') : null));
+  /* 離乳日の出し入れ。ふだんは哺乳ボードから押しますが、
+     あとから日付を直したり、間違えて押したのを戻したりするのはここが分かりやすい。 */
+  if (isOnFarm(cow) && num(cow.parity, 0) < 1)
+    todo.appendChild(el('button', {
+      class: 'btn sm ghost', style: 'width:100%;margin-top:9px;color:var(--muted)',
+      onclick: () => openWeanForm(cow) },
+      cow.wean_date ? '🥛　離乳日 ' + fmtDate(cow.wean_date) + ' — 直す・取り消す'
+                    : '🥛　この牛を離乳にする'));
   if (isOnFarm(cow))
     todo.appendChild(el('button', {
       class: 'btn sm ghost', style: 'width:100%;margin-top:9px;color:var(--muted)',
@@ -6707,6 +6856,74 @@ function openReturnForm(cow){
 }
 
 /* ------------------------------------------------------------
+   離乳した日
+   ------------------------------------------------------------
+   プログラムの日齢はあくまで目安で、実際はスターターの食い込みで
+   前後します。「この子はこの日にやめた」を現場で残せるようにしました。
+
+   入れた日から、その牛は哺乳ボードに出なくなり、離乳期→育成へ移ります。
+   哺乳をやめる判断はハッチの前で決まるので、押す場所も哺乳ボードの中です。
+   間違えたときのために、同じ画面から取り消せるようにしてあります。
+   ------------------------------------------------------------ */
+function openWeanForm(cow){
+  const has = ymd(cow.wean_date);
+  sheet(cow.tag4 + (has ? ' の離乳日を直す' : ' を離乳にする'), (b, close) => {
+    const marks = Calc.programMarks(Calc.programKey(cow));
+    const day = ageDays(cow.birth_date);
+    const guess = marks && marks.weanDay;
+
+    b.appendChild(el('div', { class: 'note' },
+      has
+        ? el('span', {}, el('b', {}, fmtDateFull(has)), ' に離乳したことになっています。')
+        : el('span', {}, 'この日から', el('b', {}, '哺乳ボードに出なくなり'),
+            '、離乳期をへて育成に移ります。'),
+      day != null ? el('div', { style: 'margin-top:5px' },
+        '今日で ' + day + '日齢' +
+        (guess ? '　（' + Calc.programMeta(Calc.programKey(cow)).name +
+                 'の目安は ' + r0(guess) + '日齢）' : '')) : null));
+
+    const fDate = inp({ type: 'date', value: has || today() });
+    b.appendChild(field('離乳した日', fDate,
+      '前の日を入れても構いません。その日までの哺乳の記録はそのまま残ります。'));
+
+    const btn = el('button', { class: 'btn primary', style: 'width:100%;margin-top:4px' },
+      has ? 'この日に直す' : '離乳にする');
+    btn.onclick = () => submitting(btn, async () => {
+      const d = ymd(fDate.value) || today();
+      /* 個体の離乳日と、記録としての「離乳」を1回で書きます。
+         記録のほうは日付を入れ直しても増えないよう、
+         その牛の「離乳」ぜんぶを入れ替える形にしています。 */
+      Store.batchSoon([
+        { action: 'saveCow', row: { cow_no: cow.cow_no, wean_date: d } },
+        { action: 'replace', table: 'events',
+          match: { cow_no: cow.cow_no, type: '離乳' },
+          rows: [{ cow_no: cow.cow_no, date: d, type: '離乳',
+                   detail: (daysBetween(cow.birth_date, d) != null
+                             ? daysBetween(cow.birth_date, d) + '日齢' : ''), note: '' }] }
+      ], cow.tag4 + ' 離乳');
+      MilkBoard.reset(); Analysis.reset(); WeanReport.reset();
+      close(); toast(cow.tag4 + ' を離乳にしました（' + fmtDate(d) + '）'); App.render();
+    });
+    b.appendChild(btn);
+
+    if (has){
+      const un = el('button', { class: 'btn ghost', style: 'width:100%;margin-top:8px' },
+        '離乳を取り消して、哺乳に戻す');
+      un.onclick = () => submitting(un, async () => {
+        Store.batchSoon([
+          { action: 'saveCow', row: { cow_no: cow.cow_no, wean_date: '' } },
+          { action: 'replace', table: 'events',
+            match: { cow_no: cow.cow_no, type: '離乳' }, rows: [] }
+        ], cow.tag4 + ' 離乳を取り消す');
+        MilkBoard.reset(); Analysis.reset(); WeanReport.reset();
+        close(); toast(cow.tag4 + ' の離乳を取り消しました'); App.render();
+      });
+      b.appendChild(un);
+    }
+  }, { focus: false });
+}
+
+/* ------------------------------------------------------------
    和牛の血統（三代祖）
    ------------------------------------------------------------
    和牛では「父・母の父・母の母の父」の3頭で血統を言い表します。
@@ -6913,7 +7130,8 @@ function viewEntry(){
             [a.c.name, a.g.short, a.d != null ? a.d + '日齢' : null]
               .filter(Boolean).join(' · ')),
           el('div', { class: 'l2' }, a.alerts.map(x =>
-            el('span', { class: 'badge ' + x.k, style: 'margin-right:5px' }, '⚠ ' + x.t)))),
+            el('span', { class: 'badge soft' + (x.k === 'crit' ? ' hi' : ''),
+                         style: 'margin-right:5px' }, x.t)))),
         el('div', { class: 'rt' }, '›'))));
     if (al.length > 6)
       ac.appendChild(el('button', { class: 'btn ghost sm', style: 'width:100%;margin-top:10px',
@@ -7383,11 +7601,15 @@ function cowAlerts(c, g){
   const ev = (Store.recentEvents || {})[String(c.cow_no)] || [];
   const bad = ev.filter(e => /便異常|下痢|肺炎|疾病/.test(String(e.type) + String(e.detail)))
                 .sort((x, y) => String(x.date) < String(y.date) ? 1 : -1);
+  /* 便のことは毎朝いちばん見られるので、読んだだけで分かる書き方にします。
+     「×3」では何が3つなのか伝わらなかったので、
+     いつ・何が・この3週間で何回、を言葉で書きます。 */
   if (bad.length){
     const ago = daysBetween(bad[0].date, today());
-    out.push({ t: (bad[0].detail || bad[0].type) +
-      (ago === 0 ? '（今日）' : '（' + ago + '日前）') +
-      (bad.length > 1 ? ' ×' + bad.length : ''),
+    const what = bad[0].detail || bad[0].type;
+    const when = ago === 0 ? '今日' : ago === 1 ? 'きのう' : ago + '日前';
+    out.push({
+      t: what + '　' + when + (bad.length > 1 ? '　3週間で' + bad.length + '回' : ''),
       k: bad.length >= 3 || /水下痢/.test(bad[0].detail || '') ? 'crit' : 'warn' });
   }
   return out;
@@ -7493,6 +7715,15 @@ function viewHerd(){
     el('button', { class: 'btn primary', onclick: () => App.go('analysis') },
       '📈　測定日の分析をひらく')));
 
+  /* --- 哺乳〜離乳のまとめ --- */
+  wrap.appendChild(el('div', { class: 'card' },
+    el('h2', {}, '哺乳〜離乳をふりかえる'),
+    el('div', { class: 'hint', style: 'margin-bottom:10px' },
+      '離乳までの日数・ピークまでの日数とピーク日数・減乳開始・粉の通算乾物を、',
+      '実際に飲ませた記録から出します。牛どうしを並べて比べられます。'),
+    el('button', { class: 'btn primary', onclick: () => App.go('weanreport') },
+      '🍼　哺乳〜離乳のまとめをひらく')));
+
   /* --- 発育曲線 --- */
   const bm = Store.benchmark?.weightByAge;
   if (bm && Object.keys(bm).length){
@@ -7585,7 +7816,8 @@ function herdRow(r){
         c.breed === '和牛' ? el('span', { class: 'badge b2', style: 'margin-left:5px' }, '和牛') : null),
       r.alerts.length
         ? el('div', { class: 'l2' }, r.alerts.map(a =>
-            el('span', { class: 'badge ' + a.k, style: 'margin-right:5px' }, '⚠ ' + a.t)))
+            el('span', { class: 'badge soft' + (a.k === 'crit' ? ' hi' : ''),
+                         style: 'margin-right:5px' }, a.t)))
         : el('div', { class: 'l2' }, c.birth_date ? fmtDateFull(c.birth_date) + '生' : '')),
     el('div', { class: 'rt' },
       r.d == null ? '—' : el('div', {}, r.d < 200 ? r.d + '日' : r1(r.m) + 'ヶ月'),
@@ -8575,7 +8807,7 @@ const IMPORT_TARGETS = [
       ['dam_no','母の耳標10桁'], ['sire_code','精液コード'], ['sire_name','種雄牛名'],
       ['birth_weight','出生体重kg'], ['birth_chest','出生時胸囲cm'],
       ['parity','産次'], ['due_date','分娩予定日'], ['status','状態'],
-      ['pen','牛房'], ['note','備考'] ] },
+      ['wean_date','離乳した日'], ['pen','牛房'], ['note','備考'] ] },
   { table: 'milk_test', label: '乳検', cols: [
       ['cow_no','個体識別番号', true], ['date','検定日', true], ['milk_kg','乳量kg'],
       ['scc','体細胞数'], ['fat_pct','乳脂率'], ['protein_pct','乳蛋白率'],
@@ -10087,6 +10319,242 @@ function exportAnalysis(rows){
 }
 
 /* ------------------------------------------------------------
+   哺乳〜離乳のまとめ
+   ------------------------------------------------------------
+   離乳日を入れると、その子の哺乳がどうだったかを1枚で振り返れます。
+
+   数字はぜんぶ**実際に飲ませた記録**から出しています。
+   プログラムの予定ではないので、下痢で減らした日も、
+   目安より早くやめた日も、そのまま形に出ます。
+
+   ・哺乳〜離乳までの日数 … 生まれてから離乳までの日齢
+   ・ピークまでの日数     … いちばん飲んだ量に届いた日齢
+   ・ピーク日数           … その量が続いた日数
+   ・減乳開始日           … ピークのあと、はじめて減った日
+   ・減乳〜離乳までの日数 … そこから離乳までの日数
+   ・粉の通算乾物         … 代用乳の粉を乾物に直して足したもの
+   ------------------------------------------------------------ */
+
+const WeanReport = {
+  loaded: false, rows: [], cow: '', sort: 'wean',
+  reset(){ this.loaded = false; this.rows = []; },
+
+  /** 離乳したとみてよい牛を集める（離乳日が入っている牛＋哺乳が終わっている牛） */
+  candidates(){
+    return Store.cows.filter(c => {
+      if (!c.birth_date) return false;
+      if (c.wean_date) return true;
+      const g = Calc.groupOf(c).key;
+      const d = ageDays(c.birth_date);
+      /* 離乳日を入れていない牛も拾います。減乳期の牛を入れているのは、
+         目安より早くやめた子を取りこぼさないため。
+         本当に終わっているかは、記録が途切れているかで下で確かめます。
+         範囲を400日までにしているのは、経産牛まで読みに行かないためです。 */
+      return (g === 'milk3' || g === 'milk4' || g === 'growing') && d != null && d <= 400;
+    }).sort((a, b) => {
+      const ka = a.wean_date || addDays(a.birth_date, 70);
+      const kb = b.wean_date || addDays(b.birth_date, 70);
+      return ka < kb ? 1 : -1;
+    });
+  },
+
+  async load(){
+    if (this.loaded) return;
+    const cows = this.candidates().slice(0, 80);
+    if (!cows.length){ this.loaded = true; this.rows = []; return; }
+    // 1往復でまとめて取る（1頭ずつだと80往復＝10分近くかかる）
+    await Store.prefetch(cows.map(c => c.cow_no), ['milk_feed']);
+    const out = [];
+    cows.forEach(c => {
+      const feeds = (Store.cache[String(c.cow_no)] || {}).milk_feed || [];
+      if (!feeds.length) return;
+      const s = Calc.weanSummary(c, Calc.dailyMilk(c, feeds));
+      if (!s) return;
+      /* 離乳日が入っていない牛は、記録が途切れていてはじめて「終わった」とみなします。
+         きのうも飲ませている牛を離乳済みとして並べてしまわないため。 */
+      const age = ageDays(c.birth_date);
+      if (!s.hasWean && age != null && age - s.lastFeed < 3) return;
+      out.push(Object.assign({ cow: c }, s));
+    });
+    this.rows = out;
+    this.loaded = true;
+  },
+
+  /** 牧場の中央値。比べる相手がいてはじめて数字は意味を持つ */
+  median(key){
+    const v = this.rows.map(r => r[key]).filter(x => x != null && isFinite(x)).sort((a, b) => a - b);
+    if (!v.length) return null;
+    const m = Math.floor(v.length / 2);
+    return v.length % 2 ? v[m] : (v[m - 1] + v[m]) / 2;
+  }
+};
+
+const WEAN_COLS = [
+  { key: 'weanDay',   label: '離乳',       unit: '日齢', fmt: r0 },
+  { key: 'peakStart', label: 'ピークまで', unit: '日',   fmt: r0 },
+  { key: 'peakDays',  label: 'ピーク',     unit: '日',   fmt: r0 },
+  { key: 'downDays',  label: '減乳〜離乳', unit: '日',   fmt: r0 },
+  { key: 'powderDM',  label: '粉の乾物',   unit: 'kg',   fmt: r1 }
+];
+
+async function viewWeanReport(container){
+  App.setTop('哺乳〜離乳のまとめ', '', true);
+
+  if (!WeanReport.loaded){
+    container.appendChild(el('div', { class: 'empty' },
+      el('div', { class: 'spinner' }),
+      el('div', { style: 'margin-top:14px' }, '哺乳の記録を読み込んでいます…')));
+    try { await WeanReport.load(); }
+    catch (e){
+      container.innerHTML = '';
+      container.appendChild(el('div', { class: 'note crit' }, e.message));
+      return;
+    }
+    container.innerHTML = '';
+  }
+
+  if (!WeanReport.rows.length){
+    container.appendChild(el('div', { class: 'empty' }, el('div', { class: 'big' }, '🍼'),
+      '離乳した牛がまだいません',
+      el('div', { class: 'hint', style: 'margin-top:10px' },
+        '哺乳ボードで「この牛を離乳にする」を押すと、ここに出てきます。')));
+    return;
+  }
+
+  if (WeanReport.cow){
+    const r = WeanReport.rows.find(x => String(x.cow_no) === String(WeanReport.cow));
+    if (r){ container.appendChild(weanOneCow(r)); return; }
+    WeanReport.cow = '';
+  }
+  container.appendChild(weanList());
+}
+
+/* --- 一覧（並べて比べる） --- */
+function weanList(){
+  const wrap = el('div');
+  const rows = WeanReport.rows;
+
+  /* 牧場の真ん中。1頭の数字は、これと比べてはじめて意味が出ます。 */
+  const mc = el('div', { class: 'card' });
+  mc.appendChild(el('h2', {}, 'この牧場の真ん中',
+    el('span', { class: 'note' }, rows.length + '頭の中央値')));
+  const tiles = el('div', { class: 'tiles' });
+  WEAN_COLS.forEach(c => {
+    const m = WeanReport.median(c.key);
+    tiles.appendChild(el('div', { class: 'tile' },
+      el('div', { class: 'k' }, c.label),
+      el('div', { class: 'v' }, m == null ? '—' : c.fmt(m), el('small', {}, c.unit))));
+  });
+  mc.appendChild(tiles);
+  mc.appendChild(el('div', { class: 'hint', style: 'margin-top:8px' },
+    '実際に飲ませた記録から出しています。離乳日を入れていない牛は、',
+    '哺乳の記録が途切れた翌日を離乳日とみなしています。'));
+  wrap.appendChild(mc);
+
+  /* 並べ替え */
+  const lc = el('div', { class: 'card' });
+  lc.appendChild(el('h2', {}, '離乳した牛', el('span', { class: 'note' }, rows.length + '頭')));
+  const seg = el('div', { class: 'seg', style: 'margin-bottom:10px' });
+  [['wean', '離乳が新しい順'], ['weanDay', '離乳日齢の順'], ['powderDM', '粉の多い順']]
+    .forEach(([k, lab]) => seg.appendChild(el('button', {
+      'aria-pressed': WeanReport.sort === k,
+      onclick: () => { WeanReport.sort = k; App.render(); } }, lab)));
+  lc.appendChild(seg);
+
+  const sorted = rows.slice().sort((a, b) => {
+    if (WeanReport.sort === 'weanDay') return (a.weanDay ?? 999) - (b.weanDay ?? 999);
+    if (WeanReport.sort === 'powderDM') return (b.powderDM ?? 0) - (a.powderDM ?? 0);
+    return String(a.weanDate) < String(b.weanDate) ? 1 : -1;
+  });
+
+  const tbl = el('table', { class: 't' },
+    el('thead', {}, el('tr', {},
+      el('th', { style: 'text-align:left' }, '4桁'),
+      WEAN_COLS.map(c => el('th', {}, c.label)))),
+    el('tbody', {}, sorted.map(r => el('tr', {
+      style: 'cursor:pointer',
+      onclick: () => { WeanReport.cow = r.cow_no; App.render(); } },
+      el('td', { style: 'text-align:left;font-weight:700' }, r.tag4 || mid4(r.cow_no),
+        r.hasWean ? null : el('span', { class: 'badge soft', style: 'margin-left:6px' }, '推定')),
+      WEAN_COLS.map(c => el('td', {},
+        r[c.key] == null ? '—' : c.fmt(r[c.key])))))));
+  lc.appendChild(el('div', { class: 'tblwrap' }, tbl));
+  lc.appendChild(el('div', { class: 'hint', style: 'margin-top:8px' },
+    '牛をタップすると、その子の1頭ぶんのまとめが出ます。'));
+  wrap.appendChild(lc);
+  return wrap;
+}
+
+/* --- 1頭ぶん --- */
+function weanOneCow(r){
+  const wrap = el('div');
+  const c = r.cow;
+
+  wrap.appendChild(el('button', { class: 'btn ghost sm', style: 'margin-bottom:10px',
+    onclick: () => { WeanReport.cow = ''; App.render(); } }, '‹　一覧にもどる'));
+
+  const hc = el('div', { class: 'card' });
+  hc.appendChild(el('h2', {}, (r.tag4 || mid4(r.cow_no)) + ' の哺乳',
+    el('span', { class: 'note' }, c.name || '')));
+  hc.appendChild(el('div', { class: 'note' + (r.hasWean ? '' : ' warn') },
+    r.hasWean
+      ? el('span', {}, el('b', {}, fmtDateFull(r.weanDate)), ' に離乳（', r.weanDay, '日齢）')
+      : el('span', {}, '離乳日が入っていないので、哺乳の記録が途切れた翌日（',
+          el('b', {}, r.weanDay + '日齢'), '）を離乳日とみなしています。',
+          el('br'), 'カルテか哺乳ボードから実際の日を入れると、ここも正しくなります。')));
+
+  /* 6つの数字。中央値との差を添えて、「この子はどうだったか」が分かるように */
+  const tiles = el('div', { class: 'tiles' });
+  const put = (k, v, u, d) => tiles.appendChild(el('div', { class: 'tile' },
+    el('div', { class: 'k' }, k),
+    el('div', { class: 'v' }, v == null ? '—' : v, u ? el('small', {}, u) : null),
+    d ? el('div', { class: 'd' }, d) : null));
+  const vs = (key, val) => {
+    const m = WeanReport.median(key);
+    if (m == null || val == null) return '';
+    const dd = val - m;
+    if (Math.abs(dd) < 0.05) return '牧場の真ん中と同じ';
+    return '牧場より ' + (dd > 0 ? '+' : '') + (Math.abs(dd) < 1 ? r1(dd) : r0(dd));
+  };
+  put('哺乳〜離乳', r0(r.weanDay), '日', vs('weanDay', r.weanDay));
+  put('ピークまで', r.peakStart == null ? null : r0(r.peakStart), '日', vs('peakStart', r.peakStart));
+  put('ピーク日数', r.peakDays == null ? null : r0(r.peakDays), '日',
+      r.peakL ? 'いちばん多い日 ' + r1(r.peakL) + ' L' : '');
+  put('減乳開始', r.stepDownDay == null ? null : r0(r.stepDownDay), '日齢',
+      r.stepDownDate ? fmtDate(r.stepDownDate) : '');
+  put('減乳〜離乳', r.downDays == null ? null : r0(r.downDays), '日', vs('downDays', r.downDays));
+  put('粉の通算乾物', r1(r.powderDM), 'kg', '粉 ' + r1(r.powderKg) + ' kg');
+  hc.appendChild(tiles);
+  hc.appendChild(el('div', { class: 'hint', style: 'margin-top:8px' },
+    '飲ませた日数 ' + r.fedDays + '日　／　通算 ' + r1(r.milkL) + ' L　／　1日あたり ' +
+    r1(r.perDayL) + ' L'));
+  wrap.appendChild(hc);
+
+  /* 形を見る。数字だけだと「増やし方」が分からないため */
+  const gc = el('div', { class: 'card' });
+  gc.appendChild(el('h2', {}, '飲んだ量の移りかわり'));
+  gc.appendChild(Chart.plot({
+    height: 250,
+    bars: [{ name: '1日あたり (L)', points: r.daily.map(d => ({ x: d.day, y: d.milkL })),
+             color: cssVar('--s1') }],
+    markers: [
+      r.peakStart != null ? { x: r.peakStart, label: 'ピーク', color: cssVar('--s1') } : null,
+      r.stepDownDay != null ? { x: r.stepDownDay, label: '減乳', color: cssVar('--s4') } : null,
+      { x: r.weanDay, label: '離乳', color: cssVar('--s2'), solid: true }
+    ].filter(Boolean),
+    x: { label: '日齢' }, y: { label: 'L / 日', zero: true },
+    caption: '棒＝その日に実際に飲ませた量。縦線＝ピークに届いた日・はじめて減った日・離乳した日。'
+  }));
+  wrap.appendChild(gc);
+
+  wrap.appendChild(el('div', { class: 'card' },
+    el('h2', {}, 'この牛を見る'),
+    el('button', { class: 'btn primary', style: 'width:100%',
+      onclick: () => App.openCow(r.cow_no) }, '📋　カルテをひらく')));
+  return wrap;
+}
+
+/* ------------------------------------------------------------
    16. 哺乳ボード — 現場での毎日の入力
    ------------------------------------------------------------
    使い方の想定（毎日の入力をできるだけ減らす）：
@@ -10944,6 +11412,14 @@ function milkRow(r){
     el('button', { class: 'btn sm ghost',
       onclick: () => { r.am = r.pm = null; r.refused = ''; r.feces = ''; r.note = '';
                        r.changed = false; App.render(); } }, 'この牛を空に')));
+
+  /* 哺乳をやめる判断は、ハッチの前で決まります。
+     その場で押せることが大事なので、哺乳画面の中に置いています。
+     押すと確認の画面が出て、日付も直せます（すぐには消えません）。 */
+  det.appendChild(el('button', {
+    class: 'btn sm ghost', style: 'width:100%;margin-top:8px;color:var(--muted)',
+    onclick: () => openWeanForm(r.cow)
+  }, '🥛　この牛を離乳にする（今日で哺乳をやめる）'));
 
   // 市場に出た・預託に出した牛は、ここから外せます。
   // 現場でその場で押せるのが大事なので、哺乳画面の中に置いています。
@@ -12282,6 +12758,11 @@ App.render = function(){
   if (this.view === 'analysis'){
     const v = customView('herd');
     viewAnalysis(v);
+    return;
+  }
+  if (this.view === 'weanreport'){
+    const v = customView('herd');
+    viewWeanReport(v);
     return;
   }
   if (this.view === 'pens'){
